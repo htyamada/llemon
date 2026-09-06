@@ -47,9 +47,9 @@ similarity_browse      = _vs.similarity_browse
 semantic_search        = _vs.semantic_search
 compare                = _vs.compare
 cluster_detail         = _vs.cluster_detail
-mark_toggle            = _vs.mark_toggle
-deletion_list_download = _vs.deletion_list_download
-deletion_list_clear    = _vs.deletion_list_clear
+hide_image             = _vs.hide_image
+restore_image          = _vs.restore_image
+hidden_images          = _vs.hidden_images
 similar                = _vs.similar
 thumb                  = _vs.thumb
 image                  = _vs.image
@@ -72,9 +72,9 @@ urlpatterns = [
     path('cluster/<int:cluster_id>/', views.cluster_detail,        name='cluster_detail'),
     path('embed-stream/',            views.embed_stream,           name='embed_stream'),
     path('embed-cancel/',            views.embed_cancel,           name='embed_cancel'),
-    path('mark/',                    views.mark_toggle,            name='mark_toggle'),
-    path('deletion-list/',           views.deletion_list_download, name='deletion_list_download'),
-    path('deletion-list/clear/',     views.deletion_list_clear,    name='deletion_list_clear'),
+    path('hide/',                    views.hide_image,             name='hide_image'),
+    path('hidden/',                  views.hidden_images,          name='hidden_images'),
+    path('restore/',                 views.restore_image,          name='restore_image'),
     path('similar/',                 views.similar,                name='similar'),
     path('thumb/',                   views.thumb,                  name='thumb'),
     path('image/',                   views.image,                  name='image'),
@@ -93,11 +93,35 @@ INSTALLED_APPS = [
 ]
 
 IMHANDLER_VARIANT = 'hty7'  # llime; knip uses 'qat'
+
+# Optional -- see "Authorization" below. Falls back to is_staff if unset.
+IMHANDLER_BLACKLIST_AUTHORIZER = _authorize_imhandler_blacklist
 ```
 
 `imhandler.djview.apps.ImageHandlerDjviewConfig.ready()` calls
 `appconfig.init_variant(IMHANDLER_VARIANT)`, so the variant difference lives
 in configuration rather than in host-local app code.
+
+### Authorization
+
+Hide, Restore, and the Hidden images page are gated by
+`settings.IMHANDLER_BLACKLIST_AUTHORIZER(request) -> bool`. If the host
+project does not set it, `_default_blacklist_authorizer` is used:
+`request.user is not None and request.user.is_authenticated and request.user.is_staff`.
+`llime` wraps its existing document-viewer authorization hook (llime is
+authenticated by the web server, outside Django, so this is not a plain
+`is_staff` check there):
+
+```python
+# llime/config/settings.py
+def _authorize_imhandler_blacklist(request):
+    return _authorize_document_viewer(request, 'blacklist')
+
+IMHANDLER_BLACKLIST_AUTHORIZER = _authorize_imhandler_blacklist
+```
+
+`knip` does not currently set `IMHANDLER_BLACKLIST_AUTHORIZER`, so it uses
+the `is_staff` default as-is.
 
 ---
 
@@ -105,8 +129,10 @@ in configuration rather than in host-local app code.
 
 ### `index`
 
-Renders `image_handler/index.html` with three section links (Browse,
-Similarity, Compare) as relative URLs.
+Renders `image_handler/index.html` with section links (Browse, Similarity,
+Semantic, Compare) as relative URLs, plus a **Hidden images** link — only
+included in the context (and so only rendered) when
+`_can_manage_blacklist(request)` is true for the current request.
 
 ### `browse` and `similarity_browse`
 
@@ -141,60 +167,92 @@ are separated into `large_clusters` and rendered at the bottom of the page.
 
 ### `cluster_detail`
 
-Path parameter `cluster_id`. Model and threshold come from GET params.
+Path parameter `cluster_id`. Model and threshold come from GET params (used
+only to build `back_url`, the link back to `compare`).
 
-1. Calls `get_cluster_members(conn, cluster_id)`.
-2. Calls `cleanup_missing_members(conn, cluster_id)` to remove records for
-   files that no longer exist.
-3. If `remaining_count <= 1` after cleanup, deletes the cluster and redirects
-   to `compare`.
-4. Reads `request.session['deletion_list']` to mark already-selected images.
+1. Calls `get_cluster_members(conn, cluster_id)` — already excludes hidden
+   members.
+2. If fewer than 2 rows come back, a direct `SELECT 1 FROM Clusters WHERE
+   id = ?` distinguishes "no such cluster" (`Http404`) from "cluster
+   collapsed because its members are hidden" (redirect to `compare`,
+   nothing deleted) — `get_cluster_members` alone can't tell these apart,
+   since both produce the same empty/near-empty result.
+3. Calls `cleanup_missing_members(conn, cluster_id)` to delete rows for
+   files genuinely missing from disk (blacklist-blind — a hidden-but-present
+   file is never treated as missing here). If `remaining_count <= 1`, the
+   cluster's rows are deleted and the page redirects to `compare`.
+4. A second, blacklist-aware check: of the original `rows`, excluding the
+   ones `cleanup_missing_members` just deleted, if fewer than 2 remain
+   visible, redirect to `compare` **without deleting anything** — the
+   cluster may still be a real pair once a hidden member is restored. This
+   is the check step 3's `remaining_count` can't perform, since hiding
+   doesn't change `remaining_count` by design.
+5. Renders the surviving members plus `can_manage_blacklist =
+   _can_manage_blacklist(request)`, which gates the Hide button and the
+   shared confirmation modal in the template.
 
-### `mark_toggle`
+### `hide_image`
 
-POST only. Reads `path` from POST body. Toggles the path in
-`request.session['deletion_list']`. Returns
-`JsonResponse({'marked': bool, 'count': int})` for the JS handler to update
-the UI without a page reload.
+POST only. Returns 403 (`JsonResponse`) if `_can_manage_blacklist(request)`
+is false. Reads `path` from the POST body; 400 if absent. Calls
+`blacklist.add(path)`: `ValueError` (path not absolute/under a root/wrong
+suffix) becomes 400, `BlacklistError`/`EnvironmentError` (store unreadable
+or unwritable) becomes 500, otherwise `JsonResponse({'ok': True})`. This is
+the endpoint the shared `_hide_modal.html` JS posts to via `fetch`.
 
-### `deletion_list_download`
+### `restore_image`
 
-Builds a POSIX shell script:
+POST only. Returns a plain (non-`JsonResponse`) 403 if unauthorized — this
+endpoint is reached from an HTML `<form>` on the Hidden images page, not
+`fetch`, so a redirect-shaped denial rather than a JSON body is what a
+non-JS client actually needs. Reads `path` from the POST body; if present,
+calls `blacklist.remove_stored(path)` (not `remove()` — this must succeed
+even if `path`'s root has since been reconfigured away). A store failure
+returns a plain-text 500 body. On success (or if `path` was already absent,
+a no-op), redirects (302) to `hidden_images`.
 
-```sh
-#!/bin/sh
-rm -- '<path1>'
-rm -- '<path2>'
-```
+### `hidden_images`
 
-Single quotes in paths are escaped with `'\''`. Content-Type is
-`text/x-shellscript`. The deletion list is cleared (`[]`) after the response
-is built, before it is returned.
-
-### `deletion_list_clear`
-
-POST only. Sets `request.session['deletion_list'] = []`. Redirects to the
-`next` POST parameter, or falls back to `image_handler:compare`.
+GET only. Returns the app's `error.html` at 403 if unauthorized, or at 500
+if `blacklist.load()` raises (`BlacklistError`/`EnvironmentError` — a
+corrupt store or an unconfigured `cache_dir`). Otherwise renders every
+stored path together with `p.is_file()`, so the template can flag entries
+that are hidden but no longer present on disk.
 
 ### `similar`
 
 Reads `?path=` (absolute path) and `?model=clip|sscd`. Validates that the
-path is under `image_root`. Calls `find_similar(conn, path, model)` and
-renders up to 8 results. The focal image and each neighbour have Mark buttons
-wired to `mark_toggle`.
+path is under `image_root`. If `path` itself is hidden, renders
+`hidden_focal=True` and a short notice instead of calling `find_similar` at
+all. Otherwise calls `find_similar(conn, path, model, blocked=blocked)` (the
+same snapshot used for the hidden-focal check, so the two never disagree)
+and renders up to 8 results. For an authorized request
+(`can_manage_blacklist`), the focal image and the closest match each have a
+Hide button wired to the shared modal.
 
 ### `thumb`
 
-Reads `?path=` and `?size=200` (int, clamped to 50–800). Constructs an
-`ImageEntry` from the path and its current mtime, calls `get_or_create()`,
-and returns the JPEG bytes with `Cache-Control: max-age=3600`. Returns HTTP
-404 on any error.
+Reads `?path=` and `?size=200` (int, clamped to 50–800). Before constructing
+an `ImageEntry` or calling `get_or_create()`, loads the blacklist
+(`blacklist.load_if_configured()`) and 404s immediately if `path` is
+hidden — a `BlacklistError` from a corrupt/unreadable store also 404s
+(fail closed), never 500. This check runs before the `If-Modified-Since`
+comparison, so a client's stale cached validator can never be answered 304
+for an image that has since been hidden. On success, returns the JPEG bytes
+with `Cache-Control: private, no-cache` (always revalidated, never served
+straight from a shared/browser cache without a round trip) and
+`Last-Modified`. A 404 response (missing, out-of-root, hidden, or a
+generation failure) sets `Cache-Control: no-store` instead, so the negative
+result itself is never cached either.
 
 ### `image`
 
-Reads `?path=`. Streams the full-size original using a chunked generator
-(64 KB chunks). Sets `Content-Length` and `Cache-Control: max-age=3600`.
-Uses `mimetypes.guess_type` for the content type.
+Reads `?path=`. Runs the identical hidden-path pre-check as `thumb` (before
+the `If-Modified-Since` comparison, for the same cache-poisoning reason),
+then streams the full-size original using a chunked generator (64 KB
+chunks). Sets `Content-Length` and `Cache-Control: private, no-cache` (a 304
+response gets the same header); a 404 sets `Cache-Control: no-store`. Uses
+`mimetypes.guess_type` for the content type.
 
 ### `embed_stream`
 
@@ -235,11 +293,11 @@ token). Reads `album` from POST body.
 
 ---
 
-## Session layout
+## State
 
-| Key | Type | Set by | Cleared by |
-|-----|------|--------|------------|
-| `deletion_list` | `list[str]` | `mark_toggle` | `deletion_list_download`, `deletion_list_clear` |
+`imhandler.djview` holds no session state for hiding/restoring. Hidden-image
+state lives entirely in the persistent `imhandler.blacklist` store (see
+`imhandler-specs.md`), shared across requests, workers, and the CLI.
 
 ---
 

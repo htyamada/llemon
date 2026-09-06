@@ -44,11 +44,20 @@ All generated files live under `cache_dir`:
 
 ```
 cache_dir/
-  thumbs/       thumbnail cache
-  db/           SQLite database (dedup.db)
-  weights/      downloaded model weights
-  logs/         per-run error logs
+  thumbs/           thumbnail cache
+  db/               SQLite database (dedup.db)
+  weights/          downloaded model weights
+  logs/             per-run error logs
+  blacklist.json    persistent hide/restore store
+  .blacklist.lock   lock file for concurrent blacklist updates
 ```
+
+A hidden image is excluded by every subcommand below (`imh list` and `imh
+thumb` included) as if it did not exist, without ever touching its file on
+disk — see **imh blacklist** below for inspecting and exporting the current
+list. The one exception: `imh list DIR` run with `cache_dir` unconfigured
+filters nothing (there is no store to consult) rather than treating that as
+an error.
 
 The tools require the `~/opt/web` venv. Run
 `set-up-system/250-python-web.sh` once to create it.
@@ -141,7 +150,11 @@ imh thumb [options] [DIR]
 | `-v, --verbose` | Print each thumbnail path as it is created |
 
 Each `--size` value is cached independently. A thumbnail is regenerated if the
-source file has been modified since it was cached.
+source file has been modified since it was cached. Hidden images are
+excluded from the scan entirely (no thumbnail is generated, and an existing
+one is not removed here — that's `imh purge`'s job); `-n`/`--dry-run`
+reports how many were excluded this way: `N image(s) found, M hidden, no
+thumbnails generated`.
 
 Thumbnails that cannot be generated are reported to stderr and logged under
 `cache_dir/logs/`. Exit status is 1 if any error occurred.
@@ -161,9 +174,34 @@ imh purge [options] [DIR]
 | `DIR` | Root directory to scan (default: `image_root` from config) |
 | `-n, --dry-run` | Report what would be removed without deleting anything |
 
-Scans `DIR` for current images, then removes every thumbnail in
-`cache_dir/thumbs/` and every database record whose source image is no longer
-present. Reports counts for both. Exit status is 1 if any removal failed.
+"Current" means present on disk *and* not hidden — a hidden image is purged
+from thumbnails, the database, and cluster membership exactly like a
+deleted file, without its archive file ever being touched; restoring it
+later makes it eligible for regeneration again.
+
+Without `DIR`, scans every configured `image_root`, removes every thumbnail
+in `cache_dir/thumbs/` with no current source, and every database record
+(and now-too-small cluster) with no current source. With `DIR`, the
+database/cluster sweep is scoped to records under `DIR` only (a stale
+record elsewhere is left alone), and the thumbnail sweep is skipped
+entirely and reported as such — a thumbnail's filename has no path in it,
+so it can't be matched to `DIR` without scanning every root anyway; run
+with no `DIR` to sweep thumbnails.
+
+Example output:
+
+```
+$ imh purge
+12 thumbnail(s) removed, 0 error(s)
+7 DB record(s) removed, 0 error(s)
+2 cluster(s) collapsed (fewer than two members remaining)
+$ imh purge ~/Photos/Vacation
+thumbnail sweep skipped (DIR given; run with no DIR to sweep thumbnails)
+3 DB record(s) removed, 0 error(s)
+1 cluster(s) collapsed (fewer than two members remaining)
+```
+
+Exit status is 1 if any removal failed.
 
 ## imh embed
 
@@ -262,6 +300,37 @@ imh report [options]
    [1] degraded           lap=0.0031   1280x853   /home/yamada/Photos/img001b.jpg
 
 ```
+
+## imh blacklist
+
+Inspect and export the persistent image blacklist — the same store the
+web UI's Hide/Restore buttons and every other `imh` subcommand consult.
+There is no `imh blacklist hide`/`restore`; hiding and restoring are web-UI
+actions (see `imhandler-django-man.md`) — this subcommand is read-only.
+
+```
+imh blacklist export [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output FILE` | Write to `FILE` instead of stdout |
+| `--format FORMAT` | `paths` (default, one per line), `paths0` (NUL-terminated, for `find -print0`/`xargs -0`), or `json` (`{"version": 1, "paths": [...]}`) |
+
+The export is plain data, never executable, regardless of format. `-o`
+refuses to write to the blacklist store or lock file, to a path under any
+configured `image_root`, or to a file literally named `-` (omit `-o` to
+write to stdout instead) — an export must never itself become a path the
+scanner (or a future blacklist entry) could reference. Requires
+`cache_dir`; exits 1 if the store is corrupt or unreadable, or if any
+refused-destination case above applies.
+
+`--format paths` additionally refuses to run (exit 1, before writing
+anything) if any path contains a literal newline or carriage return, since
+that format's consumer splits on newlines — one hidden path could otherwise
+be misread as two entries. This should not occur for any path `imh
+blacklist export` can actually produce; use `--format paths0` or `--format
+json` if it ever does.
 
 ## Configuration
 

@@ -44,10 +44,13 @@ provides:
 - **Semantic** — CLIP text-to-image search across stored embeddings, with a
   user-selected result count and thumbnail clicks opening the full image
 - **Compare** — on-demand re-clustering and side-by-side cluster contact
-  sheets; mark images for deletion
+  sheets, with a Hide button per member for an authorized viewer
 - **Similar** — find the most visually similar images in the same directory
-- **Delete workflow** — marked images are collected in the session; download
-  as a `delete.sh` shell script
+- **Hiding workflow** — an authorized viewer can hide an image from every
+  viewer surface (and the CLI) without touching its file, and later restore
+  it from the Hidden images page. Non-destructive by design: unlike the
+  removed session-based Mark/download-a-shell-script flow, nothing is ever
+  deleted through the web UI
 
 ### Gallery viewer
 
@@ -72,13 +75,16 @@ lib/imhandler/
   db.py              SQLite schema, open_db, query helpers
   embedder.py        CLIP/SSCD embedding, quality metrics, find_similar
   clusterer.py       cosine similarity clustering
+  blacklist.py       persistent hide/restore store, consulted by every module above
   cli/               imh subcommand handlers
   djview/            Django viewset (ImageHandlerViewSet)
 ```
 
 The library is imported by both the `imh` CLI and the Django viewset. Gallery
 tools (`list`, `thumb`) only use `scanner`, `filter_sort`, and `thumbnailer`.
-The dedup pipeline additionally uses `embedder`, `clusterer`, and `db`.
+The dedup pipeline additionally uses `embedder`, `clusterer`, and `db`. Every
+one of these except `filter_sort` excludes hidden images by consulting
+`blacklist` (directly, or via a caller-supplied `blocked` snapshot).
 
 ---
 
@@ -89,7 +95,7 @@ The dedup pipeline additionally uses `embedder`, `clusterer`, and `db`.
 | `imhandler-overview.md` | This document |
 | `imhandler-imh-man.md` | `imh` CLI — all subcommands, options, output, configuration |
 | `imhandler-imh-impl.md` | `imh` CLI — internal behaviour, storage formats, algorithms |
-| `imhandler-django-man.md` | Web UI — pages, deletion workflow, in-browser embed |
+| `imhandler-django-man.md` | Web UI — pages, hiding workflow, in-browser embed |
 | `imhandler-django-impl.md` | Web UI — integration pattern, view details, SSE, cancellation |
 | `imhandler-specs.md` | Library API reference — all public modules and functions |
 | `imhandler-theory.md` | Theory — embeddings, cosine similarity, clustering, quality metrics |
