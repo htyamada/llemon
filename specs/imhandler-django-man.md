@@ -88,7 +88,10 @@ model links. From any thumbnail in Browse or Similarity view, use the
 If the focal image is itself hidden, the page shows a short notice and a
 link back to the directory instead of any similarity results. For an
 authorized request, a **Hide** button is shown beneath the focal image and
-beneath the closest match.
+beneath the closest match. Hiding the focal image returns to the directory,
+the same as loading the page for an already-hidden focal image; hiding the
+closest match replaces just that panel with a "Hidden." notice, leaving the
+rest of the page as-is.
 
 ### Semantic search
 
@@ -123,7 +126,7 @@ a direct POST to the Hide/Restore endpoints is rejected.
    client whose only copy predates the deploy of that header — cached under
    the old unvalidated `max-age=3600` policy — can keep rendering it from
    its own cache until that copy expires; see `imhandler-specs.md`'s caching
-   rules and the rollout note in `upgrades/blacklist.md`.
+   rules.
 3. Visit **Hidden images** (linked from the Index page) to see every
    currently hidden path, flagged if it is missing from disk. Click
    **Show again** next to a path to restore it: it becomes visible and

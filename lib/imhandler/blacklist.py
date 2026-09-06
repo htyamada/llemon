@@ -1,7 +1,7 @@
 """imhandler.blacklist — persistent image blacklist.
 
 The sole persistence and matching implementation for hidden images (see
-upgrades/blacklist.md). Stores absolute, resolved paths beneath a configured
+imhandler-specs.md). Stores absolute, resolved paths beneath a configured
 image_root at cache_root()/blacklist.json, with inter-process locking and
 atomic replacement so Django workers and CLI processes never lose an update
 or observe partial JSON. Contains no Django types.

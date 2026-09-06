@@ -200,6 +200,12 @@ suffix) becomes 400, `BlacklistError`/`EnvironmentError` (store unreadable
 or unwritable) becomes 500, otherwise `JsonResponse({'ok': True})`. This is
 the endpoint the shared `_hide_modal.html` JS posts to via `fetch`.
 
+No view in this app returns the blacklist's full contents as a downloadable
+file or a bulk-consumable API response — `hidden_images` renders it as an
+HTML table for interactive review only, one path and one restore form per
+row. Bulk export exists solely as the CLI's `imh blacklist export` (see
+`imhandler-imh-man.md`), which the web application cannot reach or trigger.
+
 ### `restore_image`
 
 POST only. Returns a plain (non-`JsonResponse`) 403 if unauthorized — this
@@ -292,6 +298,40 @@ token). Reads `album` from POST body.
    other gunicorn workers also stop.
 
 ---
+
+## Hide confirmation and Hidden images templates
+
+`_hide_modal.html` is a single shared partial (thumbnail, path, a warning
+that the archive file is left alone, Cancel/Hide buttons) included by
+`cluster_detail.html` and `similar.html`, driven by plain JavaScript
+attached to `window.imhandlerHideModal`. Each including template calls
+`.open({path, thumbUrl, name, onSuccess})` from its own Hide button's click
+handler; `onSuccess` is page-specific, so the shared modal has no knowledge
+of what page it's on:
+
+- `cluster_detail.html` removes the member's table row, closes the
+  lightbox if it's open on that member, splices it out of the in-memory
+  `MEMBERS` array (re-syncing the inert `#member-data` JSON blob and every
+  remaining row's `data-idx`), and if fewer than 2 rows remain afterward,
+  navigates to `back_url` (Compare) — a client-side mirror of
+  `cluster_detail`'s own server-side redirect-when-collapsed logic.
+- `similar.html` navigates to `browse_url` when the **focal** image is
+  hidden (nothing sensible remains to show), but only replaces the
+  closest-match panel's contents with a `Hidden.` notice when the
+  **closest match** is hidden — the focal image and its own Similar
+  results stay on screen.
+
+On submit, both modal buttons are disabled until the `fetch` to
+`hide_image` resolves; a non-OK response or a JSON `error` field is shown
+inline in the modal without closing it, so the operator can retry without
+re-opening it. A non-JSON response (a CSRF-failure page, or a 500 from
+something in front of Django) is treated as an error too, with a message
+distinguishing the 403 case from a generic failure.
+
+`hidden_images.html` renders a plain table (path, a `missing` flag when
+`p.is_file()` was false, a "Show again" form) and deliberately shows no
+thumbnails — `thumb`/`image` 404 every hidden path by design, so there is
+no URL this page could use to render one anyway.
 
 ## State
 

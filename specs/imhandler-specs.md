@@ -404,7 +404,7 @@ Return the subset of `paths` that have at least one non-null embedding
 ## `imhandler.embedder` — Embedding and quality metrics
 
 ```python
-from imhandler.embedder import compute_quality_metrics, embed_images
+from imhandler.embedder import compute_quality_metrics, embed_images, find_similar, find_semantic
 ```
 
 Requires the `~/opt/web` venv (PyTorch, open_clip, scipy).
@@ -488,6 +488,35 @@ cosine similarity of stored embeddings. Returns `(target_row, neighbors)`:
   Excludes `path` itself, hidden images, and is restricted to the
   immediate directory (no subdirectories).
 
+```python
+find_semantic(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    scope: Path | str | None = None,
+    n: int = 24,
+    weights_dir: Path | None = None,
+    blocked: AbstractSet[Path] | None = None,
+) -> tuple[list[dict], int]
+```
+
+Find the `n` CLIP-nearest images to a text `query`, across every embedded
+image in the database (or under `scope`, if given — restricted to that
+directory and its subdirectories). Returns `(results, candidate_count)`:
+
+- `results` — list of dicts with keys `path`, `similarity` (float, rounded
+  to 3 dp), `width`, `height`, ordered by descending similarity, truncated
+  to `n`.
+- `candidate_count` — the number of embedded, non-hidden images considered
+  (before truncation to `n`), for a UI to show e.g. "showing 24 of 311
+  matches."
+
+An empty (or all-whitespace) `query` returns `([], 0)` without touching the
+database or loading the CLIP text model. Hidden images are excluded from
+the candidate set (checked against `blocked`, or the current blacklist if
+`blocked` is omitted) before ranking, so a hidden image can never appear in
+results regardless of `n`.
+
 ### Models
 
 **CLIP ViT-B/32** (`open_clip`, pretrained `'openai'`): general-purpose
@@ -545,9 +574,23 @@ image is *hidden* (not deleted) by adding its resolved path to a JSON store
 at `cache_root()/blacklist.json`; every reader in this package (`scanner`,
 `thumbnailer`, `db`, `embedder`, `clusterer`) consults it and excludes
 hidden images, so a single `add()` call is enough to remove an image from
-every viewer surface. The archive file itself is never touched. Contains no
-Django types; `imhandler.djview` is the only caller with `path` values
-sourced from HTTP requests rather than a previous `load()`.
+every viewer surface. The archive file itself is never touched, and no
+function in this module ever opens, deletes, or requires write access to
+an image root — every write this module makes is confined to `cache_dir`,
+so a read-only archive root works with hiding exactly as well as a
+writable one. Contains no Django types; `imhandler.djview` is the only
+caller with `path` values sourced from HTTP requests rather than a
+previous `load()`.
+
+Identity is path-based, not content- or inode-based: `add()`/`remove()`
+never `stat()` or read the target file, so a path can be hidden whether or
+not anything currently exists there (useful for hiding a path in advance,
+or leaving a stale entry for a file that's since been deleted elsewhere).
+A new file later written to that same path stays hidden, since nothing
+distinguishes it from the file that was there when it was hidden; a file
+moved or renamed to a *different* path is a different identity and is not
+automatically hidden, even if the renamed file's bytes are identical to a
+hidden one.
 
 ```python
 class BlacklistError(Exception)
@@ -715,9 +758,17 @@ revalidates gets the 404 as soon as the image is hidden. This does not
 retroactively invalidate a response a client cached before this header was
 deployed — a copy stored under the previous `max-age=3600` policy remains
 servable, unvalidated, until that copy's hour expires regardless of when the
-image is later hidden. See the rollout note in `upgrades/blacklist.md`
-(deploying the header change and waiting out that hour before relying on
-Hide to take effect immediately).
+image is later hidden — a deployment that changes this header and makes
+Hide reachable at the same time should expect that window, rather than
+assume the header change alone closes it immediately.
+
+`thumb` and `image` also give the *identical* 404 (same status, same
+`Image not found` body, same `no-store` header) for a hidden path and a
+path that was never blacklisted at all but simply doesn't exist — the
+response never reveals whether a given in-root path is hidden or just
+absent. (A path outside every configured root is rejected earlier with a
+different message, `Path not under any configured root`, since that
+distinction reveals nothing about any specific archive file.)
 
 ### Authorization
 

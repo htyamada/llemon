@@ -307,6 +307,9 @@ Inspect and export the persistent image blacklist — the same store the
 web UI's Hide/Restore buttons and every other `imh` subcommand consult.
 There is no `imh blacklist hide`/`restore`; hiding and restoring are web-UI
 actions (see `imhandler-django-man.md`) — this subcommand is read-only.
+Conversely, bulk export exists only here: no web route returns the
+blacklist's full contents (the Hidden images page is interactive-review
+only, one path and one restore form per row).
 
 ```
 imh blacklist export [options]
