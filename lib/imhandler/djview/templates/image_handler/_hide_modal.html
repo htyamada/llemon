@@ -1,0 +1,73 @@
+<div id="hide-modal" class="hm-overlay" hidden>
+  <form id="hide-modal-form" class="hm-box">
+    {% csrf_token %}
+    <img id="hm-thumb" src="" alt="">
+    <div id="hm-path"></div>
+    <p>The archive file remains on disk; imhandler will stop displaying and processing it.</p>
+    <div id="hm-error" class="hm-error" hidden></div>
+    <div class="hm-actions">
+      <button type="button" id="hm-cancel">Cancel</button>
+      <button type="submit" id="hm-confirm">Hide</button>
+    </div>
+  </form>
+</div>
+<script>
+(function() {
+  const HIDE_URL = "{% url 'image_handler:hide_image' %}";
+  const overlay = document.getElementById('hide-modal');
+  const form = document.getElementById('hide-modal-form');
+  const thumbEl = document.getElementById('hm-thumb');
+  const pathEl = document.getElementById('hm-path');
+  const errorEl = document.getElementById('hm-error');
+  const cancelBtn = document.getElementById('hm-cancel');
+  const confirmBtn = document.getElementById('hm-confirm');
+  let currentPath = null, currentOnSuccess = null;
+
+  function setBusy(busy) { cancelBtn.disabled = busy; confirmBtn.disabled = busy; }
+  function showError(msg) { errorEl.textContent = msg; errorEl.hidden = false; }
+  function close() { overlay.hidden = true; errorEl.hidden = true; currentPath = null; currentOnSuccess = null; }
+
+  window.imhandlerHideModal = {
+    open({path, thumbUrl, name, onSuccess}) {
+      currentPath = path; currentOnSuccess = onSuccess;
+      thumbEl.src = thumbUrl; thumbEl.alt = name; pathEl.textContent = path;
+      errorEl.hidden = true; overlay.hidden = false;
+    },
+  };
+  cancelBtn.addEventListener('click', close);
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!currentPath) return;
+    setBusy(true);
+    errorEl.hidden = true;
+    try {
+      const body = new FormData(form);  // carries csrfmiddlewaretoken from {% csrf_token %}
+      body.set('path', currentPath);
+      const response = await fetch(HIDE_URL, {method: 'POST', body});
+      let data;
+      try {
+        data = await response.json();
+      } catch (parseErr) {
+        // Django's CSRF-failure page (and any other non-JSON error page,
+        // e.g. a 500 from an app server in front of Django) lands here.
+        throw new Error(
+          response.status === 403
+            ? 'Request rejected (missing or expired CSRF token). Reload the page and try again.'
+            : `Unexpected server response (HTTP ${response.status}).`
+        );
+      }
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `Request failed (HTTP ${response.status}).`);
+      }
+      const onSuccess = currentOnSuccess;
+      close();
+      if (onSuccess) onSuccess();
+    } catch (err) {
+      showError(err.message || 'Network error -- please try again.');
+    } finally {
+      setBusy(false);
+    }
+  });
+})();
+</script>

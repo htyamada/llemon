@@ -156,6 +156,17 @@ def _authorize_document_viewer(request, action):
 
 DOCUMENT_VIEWER_AUTHORIZE = _authorize_document_viewer
 
+
+def _authorize_imhandler_blacklist(request):
+    """Same reasoning as _authorize_document_viewer: llime is authenticated
+    by the web server, outside Django. Wrapped rather than assigned
+    directly because that hook takes (request, action) and this one is
+    called with (request) alone."""
+    return _authorize_document_viewer(request, 'blacklist')
+
+
+IMHANDLER_BLACKLIST_AUTHORIZER = _authorize_imhandler_blacklist
+
 _log_dir = LLEMON_LOG_DIR
 if _log_dir:
     from datetime import datetime as _datetime

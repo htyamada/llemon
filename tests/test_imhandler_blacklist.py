@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import sys
@@ -258,6 +259,96 @@ class IsBlockedTests(ImhandlerBlacklistTestCase):
         with mock.patch.object(blacklist, 'load', side_effect=AssertionError('load() should not be called')):
             self.assertTrue(blacklist.is_blocked(target, blocked=frozenset({target})))
             self.assertFalse(blacklist.is_blocked(self.root1 / 'other.jpg', blocked=frozenset({target})))
+
+
+class RemoveStoredTests(ImhandlerBlacklistTestCase):
+    def test_removes_present_entry(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        blacklist.add(target)
+
+        self.assertTrue(blacklist.remove_stored(str(target.resolve())))
+        self.assertEqual(blacklist.load(), frozenset())
+
+    def test_absent_entry_is_a_noop(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        self.assertFalse(blacklist.remove_stored(str(target.resolve())))
+
+    def test_malformed_string_is_a_noop_not_an_error(self) -> None:
+        self.assertFalse(blacklist.remove_stored('relative.jpg'))
+        self.assertFalse(blacklist.remove_stored(''))
+        self.assertFalse(blacklist.remove_stored(str(self.root1 / 'notes.txt')))
+
+    def test_removes_entry_whose_root_is_no_longer_configured(self) -> None:
+        # The direct regression test for the Step 1 remove() gap: add()
+        # while the root is configured, then reconfigure it away, then
+        # confirm remove() would ValueError but remove_stored() still works.
+        target = self.root1 / 'photo.jpg'
+        blacklist.add(target)
+
+        with mock.patch.object(appconfig, 'image_roots', [str(self.root2)]):
+            with self.assertRaises(ValueError):
+                blacklist.remove(target)
+            self.assertTrue(blacklist.remove_stored(str(target.resolve())))
+
+        self.assertEqual(blacklist.load(), frozenset())
+
+
+class FilesystemErrorNormalizationTests(ImhandlerBlacklistTestCase):
+    """Step 3's fix: any OSError touching the store or lock file becomes
+    BlacklistError, never a bare PermissionError/OSError -- every caller in
+    the CLI and Django code is written to expect only BlacklistError."""
+
+    def test_load_permission_error_becomes_blacklist_error(self) -> None:
+        self.write_raw_store({'version': 1, 'paths': []})
+        with mock.patch('builtins.open', side_effect=PermissionError('denied')):
+            with self.assertRaises(blacklist.BlacklistError):
+                blacklist.load()
+
+    def test_lock_open_permission_error_becomes_blacklist_error(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        with mock.patch('builtins.open', side_effect=PermissionError('denied')):
+            with self.assertRaises(blacklist.BlacklistError):
+                blacklist.add(target)
+        self.assertEqual(blacklist.load(), frozenset())
+
+    def test_remove_stored_lock_open_permission_error_becomes_blacklist_error(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        blacklist.add(target)
+        with mock.patch('builtins.open', side_effect=PermissionError('denied')):
+            with self.assertRaises(blacklist.BlacklistError):
+                blacklist.remove_stored(str(target.resolve()))
+
+    def test_write_failure_survives_unlink_cleanup_also_failing(self) -> None:
+        # The direct regression test for the fix: a failed cleanup unlink
+        # must never mask the original write failure with its own OSError.
+        target = self.root1 / 'photo.jpg'
+        with mock.patch('os.replace', side_effect=OSError('replace failed')):
+            with mock.patch('os.unlink', side_effect=PermissionError('cleanup denied')):
+                with self.assertRaises(blacklist.BlacklistError) as cm:
+                    blacklist.add(target)
+        self.assertIn('replace failed', str(cm.exception))
+
+    def test_lock_acquire_failure_becomes_blacklist_error_and_leaves_store_unchanged(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        with mock.patch('fcntl.flock', side_effect=OSError('no locks available')):
+            with self.assertRaises(blacklist.BlacklistError):
+                blacklist.add(target)
+        self.assertEqual(blacklist.load(), frozenset())
+
+    def test_lock_release_failure_does_not_discard_a_successful_update(self) -> None:
+        target = self.root1 / 'photo.jpg'
+        real_flock = fcntl.flock
+
+        def fake_flock(fd, op):
+            if op == fcntl.LOCK_UN:
+                raise OSError('unlock failed')
+            return real_flock(fd, op)
+
+        with mock.patch('fcntl.flock', side_effect=fake_flock):
+            result = blacklist.add(target)
+
+        self.assertTrue(result)
+        self.assertIn(target.resolve(), blacklist.load())
 
 
 if __name__ == '__main__':

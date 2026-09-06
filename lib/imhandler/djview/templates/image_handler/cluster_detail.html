@@ -11,7 +11,6 @@
   .cd-table th.num, .cd-table td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: monospace; }
   .cd-table td.file { white-space: normal; word-break: break-all; }
   .cd-table tr:last-child td { border-bottom: none; }
-  .cd-table tr.is-marked td { background: #fff0f0; }
 
   .cd-thumb { width: 120px; height: 120px; object-fit: cover; display: block; cursor: pointer; }
   .cd-thumb:hover { opacity: 0.85; }
@@ -20,30 +19,11 @@
   .tier-1 { color: #b07000; }
   .tier-2 { color: #b00000; }
 
-  .mark-btn {
+  .hide-btn {
     font-size: 0.8em; padding: 0.2em 0.6em; cursor: pointer;
     border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;
   }
-  .mark-btn.marked { background: #fcc; border-color: #c00; color: #900; font-weight: bold; }
-  .mark-btn:hover { background: #e8e8e8; }
-  .mark-btn.marked:hover { background: #faa; }
-
-  /* ── deletion bar ── */
-  #del-bar {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    background: #222; color: #eee; font-size: 0.9em;
-    padding: 0.5em 1.2em; display: flex; align-items: center; gap: 1.2em;
-    z-index: 50;
-  }
-  #del-bar a, #del-bar button {
-    color: #adf; background: none; border: none; cursor: pointer;
-    font-size: inherit; padding: 0; text-decoration: underline;
-  }
-  #del-bar button { color: #f99; }
-  #del-bar .spacer { flex: 1; }
-
-  /* pad page so content isn't hidden under bar */
-  body { padding-bottom: 3em; }
+  .hide-btn:hover { background: #e8e8e8; }
 
   /* ── lightbox ── */
   #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 100; justify-content: center; align-items: center; }
@@ -56,6 +36,15 @@
   #lb-prev:hover, #lb-next:hover { color: #adf; }
   #lb-info { position: fixed; bottom: 2.5em; left: 50%; transform: translateX(-50%); color: #ccc; font-size: 0.9em; white-space: nowrap; }
   #lb-spinner { position: absolute; color: #888; font-size: 0.9em; }
+
+  /* ── hide confirmation modal ── */
+  .hm-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; justify-content: center; align-items: center; }
+  .hm-overlay:not([hidden]) { display: flex; }
+  .hm-box { background: #fff; padding: 1.2em 1.4em; border-radius: 4px; max-width: 24em; }
+  .hm-box img { max-width: 100%; max-height: 12em; display: block; margin-bottom: 0.6em; }
+  .hm-box #hm-path { font-size: 0.8em; color: #555; word-break: break-all; margin-bottom: 0.6em; }
+  .hm-error { color: #a00; font-size: 0.85em; margin-bottom: 0.6em; }
+  .hm-actions { display: flex; justify-content: flex-end; gap: 0.6em; }
 </style>
 
 <div class="cd-back"><a href="{{ back_url }}">&larr; Back to clusters</a></div>
@@ -64,7 +53,7 @@
   <thead>
     <tr>
       <th></th>
-      <th></th>
+      {% if can_manage_blacklist %}<th></th>{% endif %}
       <th>File</th>
       <th class="num">Dimensions</th>
       <th class="num">Laplacian</th>
@@ -76,17 +65,17 @@
   </thead>
   <tbody>
     {% for m in members %}
-    <tr class="{% if m.marked %}is-marked{% endif %}" data-path="{{ m.path }}">
+    <tr data-path="{{ m.path }}">
       <td>
         <img class="cd-thumb" src="{{ m.thumb_url }}" alt="{{ m.name }}"
              data-idx="{{ forloop.counter0 }}" loading="lazy">
       </td>
+      {% if can_manage_blacklist %}
       <td>
-        <button class="mark-btn {% if m.marked %}marked{% endif %}"
-                data-path="{{ m.path }}">
-          {% if m.marked %}Unmark{% else %}Mark{% endif %}
-        </button>
+        <button class="hide-btn" data-path="{{ m.path }}"
+                data-thumb="{{ m.thumb_url }}" data-name="{{ m.name }}">Hide</button>
       </td>
+      {% endif %}
       <td class="file">{{ m.name }}</td>
       <td class="num">
         {% if m.width and m.height %}{{ m.width }}&times;{{ m.height }}{% else %}&mdash;{% endif %}
@@ -111,17 +100,6 @@
   </tbody>
 </table>
 
-<div id="del-bar">
-  <span id="del-count">{{ deletion_count }} file{{ deletion_count|pluralize }} marked for deletion</span>
-  <span class="spacer"></span>
-  <a href="{% url 'image_handler:deletion_list_download' %}">Download list</a>
-  <form method="post" action="{% url 'image_handler:deletion_list_clear' %}" style="display:inline">
-    {% csrf_token %}
-    <input type="hidden" name="next" value="{{ request.path }}">
-    <button type="submit">Clear list</button>
-  </form>
-</div>
-
 <div id="lightbox">
   <span id="lb-close" title="Close (Esc)">&#x2715;</span>
   <span id="lb-prev" title="Previous (&#x2190;)">&#x276E;</span>
@@ -131,38 +109,40 @@
   <div id="lb-info"></div>
 </div>
 
+{% if can_manage_blacklist %}{% include 'image_handler/_hide_modal.html' %}{% endif %}
+
 {{ members|json_script:"member-data" }}
 <script>
 const MEMBERS = JSON.parse(document.getElementById('member-data').textContent);
-const MARK_URL = "{% url 'image_handler:mark_toggle' %}";
-const CSRF = document.querySelector('[name=csrfmiddlewaretoken]').value;
 
-// ── mark/unmark ──
-document.querySelectorAll('.mark-btn').forEach(btn => {
+{% if can_manage_blacklist %}
+// ── hide ──
+document.querySelectorAll('.hide-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    const path = btn.dataset.path;
-    fetch(MARK_URL, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': CSRF},
-      body: 'path=' + encodeURIComponent(path),
-    })
-    .then(r => r.json())
-    .then(data => {
-      const row = btn.closest('tr');
-      if (data.marked) {
-        btn.textContent = 'Unmark';
-        btn.classList.add('marked');
-        row.classList.add('is-marked');
-      } else {
-        btn.textContent = 'Mark';
-        btn.classList.remove('marked');
-        row.classList.remove('is-marked');
-      }
-      document.getElementById('del-count').textContent =
-        data.count + ' file' + (data.count === 1 ? '' : 's') + ' marked for deletion';
+    imhandlerHideModal.open({
+      path: btn.dataset.path, thumbUrl: btn.dataset.thumb, name: btn.dataset.name,
+      onSuccess: () => {
+        const row = btn.closest('tr');
+        const idx = parseInt(row.querySelector('.cd-thumb').dataset.idx, 10);
+        row.remove();
+        if (lb.classList.contains('open')) lbClose();
+        MEMBERS.splice(idx, 1);
+        // Keep the inert JSON blob consistent too, in case anything
+        // ever re-reads it (e.g. a restored bfcache page) rather than
+        // relying solely on the live MEMBERS variable already in scope.
+        document.getElementById('member-data').textContent = JSON.stringify(MEMBERS);
+        document.querySelectorAll('.cd-thumb').forEach(el => {
+          const i = parseInt(el.dataset.idx, 10);
+          if (i > idx) el.dataset.idx = i - 1;
+        });
+        if (document.querySelectorAll('.cd-table tbody tr').length < 2) {
+          window.location.href = "{{ back_url }}";
+        }
+      },
     });
   });
 });
+{% endif %}
 
 // ── lightbox ──
 const lb        = document.getElementById('lightbox');

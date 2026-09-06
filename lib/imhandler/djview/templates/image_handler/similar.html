@@ -15,13 +15,11 @@
   .sim-panel .fscore { font-size: 0.8em; color: #888; }
   .sim-panel-label { font-size: 0.8em; color: #999; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3em; }
 
-  .mark-btn {
+  .hide-btn {
     font-size: 0.85em; padding: 0.3em 0.8em; cursor: pointer;
     border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5; margin-top: 0.6em;
   }
-  .mark-btn.marked { background: #fcc; border-color: #c00; color: #900; font-weight: bold; }
-  .mark-btn:hover { background: #e8e8e8; }
-  .mark-btn.marked:hover { background: #faa; }
+  .hide-btn:hover { background: #e8e8e8; }
 
   .sim-neighbors { margin-top: 0.5em; }
   .sim-neighbors h3 { font-size: 0.9em; font-weight: normal; color: #555; margin: 0 0 0.6em; }
@@ -33,31 +31,30 @@
   .sim-thumb .sscore { font-size: 0.7em; color: #888; }
 
   .no-emb { color: #888; font-style: italic; font-size: 0.9em; }
-
-  /* deletion bar */
-  #del-bar {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    background: #222; color: #eee; font-size: 0.9em;
-    padding: 0.5em 1.2em; display: flex; align-items: center; gap: 1.2em;
-    z-index: 50;
-  }
-  #del-bar a, #del-bar button {
-    color: #adf; background: none; border: none; cursor: pointer;
-    font-size: inherit; padding: 0; text-decoration: underline;
-  }
-  #del-bar button { color: #f99; }
-  #del-bar .spacer { flex: 1; }
-  body { padding-bottom: 3em; }
+  .hidden-notice { color: #888; font-style: italic; }
 
   /* lightbox */
   #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 100; justify-content: center; align-items: center; }
   #lightbox.open { display: flex; }
   #lb-img { max-width: 90vw; max-height: 90vh; object-fit: contain; display: block; }
   #lb-close { position: fixed; top: 0.6em; right: 0.8em; color: #fff; font-size: 1.8em; cursor: pointer; line-height: 1; user-select: none; z-index: 101; }
+
+  /* ── hide confirmation modal ── */
+  .hm-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; justify-content: center; align-items: center; }
+  .hm-overlay:not([hidden]) { display: flex; }
+  .hm-box { background: #fff; padding: 1.2em 1.4em; border-radius: 4px; max-width: 24em; }
+  .hm-box img { max-width: 100%; max-height: 12em; display: block; margin-bottom: 0.6em; }
+  .hm-box #hm-path { font-size: 0.8em; color: #555; word-break: break-all; margin-bottom: 0.6em; }
+  .hm-error { color: #a00; font-size: 0.85em; margin-bottom: 0.6em; }
+  .hm-actions { display: flex; justify-content: flex-end; gap: 0.6em; }
 </style>
 
 <div class="sim-back"><a href="{{ browse_url }}">&larr; Back to directory</a></div>
 
+{% if hidden_focal %}
+  <p class="hidden-notice">This image has been hidden.</p>
+  <p><a href="{{ browse_url }}">&larr; Back to directory</a></p>
+{% else %}
 <div class="sim-controls">
   <span>
     Model:
@@ -73,21 +70,23 @@
     <img class="lb-trigger" src="{{ image_url }}" alt="{{ name }}" data-src="{{ image_url }}" title="Click to enlarge">
     <div class="fname">{{ name }}</div>
     {% if focal_width and focal_height %}<div class="fdims">{{ focal_width }}&times;{{ focal_height }}</div>{% endif %}
-    <button class="mark-btn {% if marked %}marked{% endif %}" data-path="{{ path }}">
-      {% if marked %}Unmark{% else %}Mark{% endif %}
-    </button>
+    {% if can_manage_blacklist %}
+    <button id="hide-focal" class="hide-btn" data-path="{{ path }}"
+            data-thumb="{{ thumb_url }}" data-name="{{ name }}">Hide</button>
+    {% endif %}
   </div>
 
   {% if closest %}
-  <div class="sim-panel">
+  <div id="closest-panel" class="sim-panel">
     <div class="sim-panel-label">Closest &mdash; <a href="{{ closest.similar_url }}">focus here</a></div>
     <img class="lb-trigger" src="{{ closest.image_url }}" alt="{{ closest.name }}" data-src="{{ closest.image_url }}" title="Click to enlarge">
     <div class="fname">{{ closest.name }}</div>
     {% if closest.width and closest.height %}<div class="fdims">{{ closest.width }}&times;{{ closest.height }}</div>{% endif %}
     <div class="fscore">{{ closest.similarity }}</div>
-    <button class="mark-btn {% if closest.marked %}marked{% endif %}" data-path="{{ closest.path }}">
-      {% if closest.marked %}Unmark{% else %}Mark{% endif %}
-    </button>
+    {% if can_manage_blacklist %}
+    <button id="hide-closest" class="hide-btn" data-path="{{ closest.path }}"
+            data-thumb="{{ closest.thumb_url }}" data-name="{{ closest.name }}">Hide</button>
+    {% endif %}
   </div>
   {% endif %}
 </div>
@@ -111,16 +110,8 @@
   <p class="no-emb">No other images with {{ model|upper }} embeddings found in this directory.</p>
 {% endif %}
 
-<div id="del-bar">
-  <span id="del-count">{{ deletion_count }} file{{ deletion_count|pluralize }} marked for deletion</span>
-  <span class="spacer"></span>
-  <a href="{% url 'image_handler:deletion_list_download' %}">Download list</a>
-  <form method="post" action="{% url 'image_handler:deletion_list_clear' %}" style="display:inline">
-    {% csrf_token %}
-    <input type="hidden" name="next" value="{{ request.path }}?path={{ path|urlencode }}&model={{ model }}">
-    <button type="submit">Clear list</button>
-  </form>
-</div>
+{% if can_manage_blacklist %}{% include 'image_handler/_hide_modal.html' %}{% endif %}
+{% endif %}
 
 <div id="lightbox">
   <span id="lb-close" title="Close (Esc)">&#x2715;</span>
@@ -128,31 +119,31 @@
 </div>
 
 <script>
-const MARK_URL = "{% url 'image_handler:mark_toggle' %}";
-const CSRF = document.querySelector('[name=csrfmiddlewaretoken]').value;
+{% if can_manage_blacklist and not hidden_focal %}
+// ── hide ──
+const focalHideBtn = document.getElementById('hide-focal');
+const closestHideBtn = document.getElementById('hide-closest');
+const closestPanel = document.getElementById('closest-panel');
 
-// mark/unmark buttons
-document.querySelectorAll('.mark-btn').forEach(btn => {
+function wireHide(btn, onSuccess) {
+  if (!btn) return;
   btn.addEventListener('click', () => {
-    fetch(MARK_URL, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRFToken': CSRF},
-      body: 'path=' + encodeURIComponent(btn.dataset.path),
-    })
-    .then(r => r.json())
-    .then(data => {
-      if (data.marked) {
-        btn.textContent = 'Unmark';
-        btn.classList.add('marked');
-      } else {
-        btn.textContent = 'Mark';
-        btn.classList.remove('marked');
-      }
-      document.getElementById('del-count').textContent =
-        data.count + ' file' + (data.count === 1 ? '' : 's') + ' marked for deletion';
+    imhandlerHideModal.open({
+      path: btn.dataset.path,
+      thumbUrl: btn.dataset.thumb,
+      name: btn.dataset.name,
+      onSuccess,
     });
   });
+}
+
+wireHide(focalHideBtn, () => { window.location.href = "{{ browse_url }}"; });
+wireHide(closestHideBtn, () => {
+  if (closestPanel) {
+    closestPanel.innerHTML = '<p class="hidden-notice">Hidden.</p>';
+  }
 });
+{% endif %}
 
 // lightbox
 const lb    = document.getElementById('lightbox');

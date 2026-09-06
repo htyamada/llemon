@@ -5,6 +5,7 @@
   <li><a href="{% url 'image_handler:similarity_browse' %}">Similarity</a></li>
   {% if semantic_url %}<li><a href="{{ semantic_url }}">Semantic</a></li>{% endif %}
   <li><a href="{% url 'image_handler:compare' %}">Compare</a></li>
+  {% if hidden_url %}<li><a href="{{ hidden_url }}">Hidden images</a></li>{% endif %}
 </ul>
 {% if specs_url %}<p><a href="{{ specs_url }}">Specs</a></p>{% endif %}
 {% endblock %}

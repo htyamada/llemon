@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from urllib.parse import urlencode
 
+from django.conf import settings  # type: ignore[import-untyped]
 from django.http import Http404, HttpResponse, JsonResponse, StreamingHttpResponse  # type: ignore[import-untyped]
 from django.shortcuts import redirect, render  # type: ignore[import-untyped]
 from django.urls import NoReverseMatch, reverse  # type: ignore[import-untyped]
@@ -24,7 +25,7 @@ from django.utils.http import http_date, parse_http_date_safe  # type: ignore[im
 from django.views.decorators.csrf import csrf_exempt  # type: ignore[import-untyped]
 from django.views.decorators.http import require_POST  # type: ignore[import-untyped]
 
-from imhandler import appconfig
+from imhandler import appconfig, blacklist
 from imhandler.cache import image_root_entries as _image_root_entries
 from imhandler.filter_sort import SortKey, filter_and_sort
 from imhandler.models import ImageEntry
@@ -67,6 +68,16 @@ def _get_roots() -> 'list[tuple[Path, str]] | None':
         return _image_root_entries()
     except EnvironmentError:
         return None
+
+
+def _default_blacklist_authorizer(request) -> bool:
+    user = getattr(request, 'user', None)
+    return bool(user is not None and user.is_authenticated and user.is_staff)
+
+
+def _can_manage_blacklist(request) -> bool:
+    hook = getattr(settings, 'IMHANDLER_BLACKLIST_AUTHORIZER', _default_blacklist_authorizer)
+    return bool(hook(request))
 
 
 def _path_to_album_rel(dir_path: Path, roots: list[Path]) -> str:
@@ -220,12 +231,14 @@ class ImageHandlerViewSet:
 
     def index(self, request):
         semantic_url = _safe_url('semantic_search')
+        hidden_url = _url('hidden_images') if _can_manage_blacklist(request) else None
         return render(request, self._t('index.html'),
                       self._ctx({
                           'title': 'Image Handler',
                           'nav': self._nav_index,
                           'semantic_url': semantic_url,
                           'specs_url': self._index_specs_url,
+                          'hidden_url': hidden_url,
                       }))
 
     # ── compare / cluster ──────────────────────────────────────────────────
@@ -252,8 +265,14 @@ class ImageHandlerViewSet:
                 'detail': str(e),
             }), status=500)
 
-        num_clusters = cluster_images(conn, model=model, threshold=threshold)
-        rows = get_cluster_member_rows(conn, model=model, threshold=threshold)
+        try:
+            num_clusters = cluster_images(conn, model=model, threshold=threshold)
+            rows = get_cluster_member_rows(conn, model=model, threshold=threshold)
+        except blacklist.BlacklistError as e:
+            conn.close()
+            return render(request, self._t('error.html'), self._ctx({
+                'title': 'Compare', 'message': 'Cannot read the blacklist.', 'detail': str(e),
+            }), status=500)
         conn.close()
 
         thumb_base = _url('thumb')
@@ -312,17 +331,44 @@ class ImageHandlerViewSet:
                 'detail': str(e),
             }), status=500)
 
-        rows = get_cluster_members(conn, cluster_id)
-
-        if not rows:
+        try:
+            rows = get_cluster_members(conn, cluster_id)
+        except blacklist.BlacklistError as e:
             conn.close()
-            raise Http404('Cluster not found')
+            return render(request, self._t('error.html'), self._ctx({
+                'title': 'Cluster', 'message': 'Cannot read the blacklist.', 'detail': str(e),
+            }), status=500)
+
+        if len(rows) < 2:
+            # rows is already blocked-filtered (get_cluster_members(),
+            # db.py), so a cluster whose members are all/mostly hidden
+            # collapses to the same shape as "no such cluster" -- tell them
+            # apart with a direct existence check before deciding.
+            cluster_exists = conn.execute(
+                'SELECT 1 FROM Clusters WHERE id = ?', (cluster_id,)
+            ).fetchone() is not None
+            conn.close()
+            if not cluster_exists:
+                raise Http404('Cluster not found')
+            return redirect(_url('compare'))
 
         missing_ids, remaining = cleanup_missing_members(conn, cluster_id)
         if remaining <= 1:
+            # Too few *real files* left, regardless of blacklist status --
+            # collapse the cluster's DB rows entirely.
             conn.execute('DELETE FROM ClusterMembership WHERE cluster_id = ?', (cluster_id,))
             conn.execute('DELETE FROM Clusters WHERE id = ?', (cluster_id,))
             conn.commit()
+            conn.close()
+            return redirect(_url('compare'))
+
+        missing_id_set = set(missing_ids)
+        visible_rows = [r for r in rows if r['image_id'] not in missing_id_set]
+        if len(visible_rows) < 2:
+            # Blacklist-aware, unlike `remaining` above: catches "too few
+            # members are actually displayable" without deleting anything --
+            # the cluster may still be a real pair once the hidden member is
+            # restored.
             conn.close()
             return redirect(_url('compare'))
 
@@ -330,12 +376,9 @@ class ImageHandlerViewSet:
 
         thumb_base = _url('thumb')
         image_base = _url('image')
-        marked_set = set(request.session.get('deletion_list', []))
-        missing_id_set = set(missing_ids)
+        can_manage_blacklist = _can_manage_blacklist(request)
         members = []
-        for row in rows:
-            if row['image_id'] in missing_id_set:
-                continue
+        for row in visible_rows:
             members.append({
                 'path': row['path'],
                 'name': Path(row['path']).name,
@@ -348,54 +391,65 @@ class ImageHandlerViewSet:
                 'blocking_score': row['blocking_score'],
                 'sharpness_consistency': row['sharpness_consistency'],
                 'quality_tier': row['quality_tier'],
-                'marked': row['path'] in marked_set,
             })
 
         return render(request, self._t('cluster_detail.html'), {
             'title': f'Cluster {cluster_id}',
             'cluster_id': cluster_id,
             'members': members,
-            'deletion_count': len(marked_set),
+            'can_manage_blacklist': can_manage_blacklist,
             'back_url': back_url,
             'base_nav': self._base_nav_rel,
             'nav': self._nav_rel,
         })
 
     @staticmethod
-    def mark_toggle(request):
-        if request.method != 'POST':
-            return HttpResponse(status=405)
+    @require_POST
+    def hide_image(request):
+        if not _can_manage_blacklist(request):
+            return JsonResponse({'error': 'Forbidden'}, status=403)
         path = request.POST.get('path', '')
         if not path:
-            return HttpResponse(status=400)
-        marked = set(request.session.get('deletion_list', []))
-        if path in marked:
-            marked.discard(path)
-            is_marked = False
-        else:
-            marked.add(path)
-            is_marked = True
-        request.session['deletion_list'] = list(marked)
-        return JsonResponse({'marked': is_marked, 'count': len(marked)})
+            return JsonResponse({'error': 'No path given'}, status=400)
+        try:
+            blacklist.add(path)
+        except ValueError as e:
+            return JsonResponse({'error': str(e)}, status=400)
+        except (blacklist.BlacklistError, EnvironmentError) as e:
+            return JsonResponse({'error': str(e)}, status=500)
+        return JsonResponse({'ok': True})
 
     @staticmethod
-    def deletion_list_download(request):
-        paths = sorted(request.session.get('deletion_list', []))
-        lines = ['#!/bin/sh'] + [
-            "rm -- '" + p.replace("'", "'\\''") + "'" for p in paths
-        ]
-        content = '\n'.join(lines) + '\n'
-        request.session['deletion_list'] = []
-        resp = HttpResponse(content, content_type='text/x-shellscript; charset=utf-8')
-        resp['Content-Disposition'] = 'attachment; filename="delete.sh"'
-        return resp
+    @require_POST
+    def restore_image(request):
+        if not _can_manage_blacklist(request):
+            return HttpResponse(status=403)
+        path = request.POST.get('path', '')
+        if path:
+            try:
+                blacklist.remove_stored(path)
+            except (blacklist.BlacklistError, EnvironmentError) as e:
+                return HttpResponse(f'Cannot update the blacklist: {e}',
+                                     status=500, content_type='text/plain; charset=utf-8')
+        return redirect(_url('hidden_images'))
 
-    @staticmethod
-    def deletion_list_clear(request):
-        if request.method != 'POST':
-            return HttpResponse(status=405)
-        request.session['deletion_list'] = []
-        return redirect(request.POST.get('next') or f'{_NS}:compare')
+    def hidden_images(self, request):
+        if not _can_manage_blacklist(request):
+            return render(request, self._t('error.html'), self._ctx({
+                'title': 'Hidden images', 'message': 'Not authorized.', 'detail': '',
+            }), status=403)
+        try:
+            blocked = blacklist.load()
+        except (blacklist.BlacklistError, EnvironmentError) as e:
+            return render(request, self._t('error.html'), self._ctx({
+                'title': 'Hidden images',
+                'message': 'Cannot read the blacklist.',
+                'detail': str(e),
+            }), status=500)
+        entries = [{'path': str(p), 'exists': p.is_file()} for p in sorted(blocked)]
+        return render(request, self._t('hidden_images.html'), self._ctx({
+            'title': 'Hidden images', 'entries': entries,
+        }))
 
     # ── browse / similarity ────────────────────────────────────────────────
 
@@ -414,7 +468,12 @@ class ImageHandlerViewSet:
             sort_key = 'name'
 
         root_paths = [p for p, _ in root_entries]
-        root_album = scan_all()
+        try:
+            root_album = scan_all()
+        except blacklist.BlacklistError as e:
+            return render(request, self._t('error.html'), self._ctx({
+                'title': 'Image Handler', 'message': 'Cannot read the blacklist.', 'detail': str(e),
+            }), status=500)
         root_name = root_entries[0][1] if len(root_entries) == 1 else 'Images'
         current = root_album if album_rel == '.' else root_album.find(album_rel)
         if current is None:
@@ -532,16 +591,23 @@ class ImageHandlerViewSet:
         thumb_base = _url('thumb')
         image_base = _url('image')
         similar_base = _url('similar')
-        marked_set = set(request.session.get('deletion_list', []))
+        can_manage_blacklist = _can_manage_blacklist(request)
 
         try:
+            blocked = blacklist.load_if_configured()
+            if path in blocked:
+                return render(request, self._t('similar.html'), self._ctx({
+                    'title': path.name, 'name': path.name,
+                    'hidden_focal': True, 'browse_url': browse_url,
+                    'can_manage_blacklist': can_manage_blacklist,
+                }))
             conn = open_db()
-            target_row, raw_neighbors = find_similar(conn, path, model)
+            target_row, raw_neighbors = find_similar(conn, path, model, blocked=blocked)
             conn.close()
-        except EnvironmentError as e:
+        except (EnvironmentError, blacklist.BlacklistError) as e:
             return render(request, self._t('error.html'), self._ctx({
                 'title': 'Similar',
-                'message': 'Cannot open image database.',
+                'message': 'Cannot load image data.',
                 'detail': str(e),
             }), status=500)
 
@@ -556,7 +622,6 @@ class ImageHandlerViewSet:
                 'thumb_url': thumb_base + '?' + urlencode({'path': nb['path']}),
                 'image_url': image_base + '?' + urlencode({'path': nb['path']}),
                 'similar_url': similar_base + '?' + urlencode({'path': nb['path'], 'model': model}),
-                'marked': nb['path'] in marked_set,
             }
             for nb in raw_neighbors
         ]
@@ -581,8 +646,7 @@ class ImageHandlerViewSet:
             'clip_url': similar_base + '?' + urlencode({'path': str(path), 'model': 'clip'}),
             'sscd_url': similar_base + '?' + urlencode({'path': str(path), 'model': 'sscd'}),
             'browse_url': browse_url,
-            'marked': str(path) in marked_set,
-            'deletion_count': len(marked_set),
+            'can_manage_blacklist': can_manage_blacklist,
         }))
 
     def semantic_search(self, request):
@@ -662,20 +726,24 @@ class ImageHandlerViewSet:
             size = 200
         size = max(50, min(800, size))
 
+        try:
+            blocked = blacklist.load_if_configured()
+        except blacklist.BlacklistError:
+            return _not_found('Image not found')
+        if path in blocked:
+            return _not_found('Image not found')
+
         root = next(r for r in root_paths if path.is_relative_to(r))
         entry = ImageEntry(path=path, rel_path=path.relative_to(root), mtime=path.stat().st_mtime)
         try:
-            thumb_path = get_or_create(entry, long_edge=size)
+            thumb_path = get_or_create(entry, long_edge=size, blocked=blocked)
         except EnvironmentError as e:
             return _not_found(f'Cache unavailable: {e}')
         except Exception:
-            # Also covers blacklist.BlockedImageError: a hidden image 404s
-            # here whether or not the image endpoint has its own explicit
-            # check yet.
             return _not_found('Thumbnail generation failed')
 
-        # Enforcement (get_or_create, above) runs before this conditional
-        # check: a blocked image never reaches here to be compared against
+        # The blocked check above runs before this conditional check: a
+        # blocked image never reaches here to be compared against
         # If-Modified-Since, so a stale validator can never be answered 304
         # for an image that has since been hidden.
         last_modified = thumb_path.stat().st_mtime
@@ -701,6 +769,13 @@ class ImageHandlerViewSet:
         if not any(path.is_relative_to(r) for r in root_paths):
             return _not_found('Path not under any configured root')
         if not path.is_file():
+            return _not_found('Image not found')
+
+        try:
+            blocked = blacklist.load_if_configured()
+        except blacklist.BlacklistError:
+            return _not_found('Image not found')
+        if path in blocked:
             return _not_found('Image not found')
 
         content_type, _ = mimetypes.guess_type(str(path))

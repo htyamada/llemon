@@ -23,7 +23,8 @@ _VERSION = 1
 
 
 class BlacklistError(Exception):
-    """The blacklist store exists but is corrupt or unsupported."""
+    """The blacklist store is corrupt, unsupported, or cannot be read or
+    written because of a filesystem error (e.g. permissions)."""
 
 
 class BlockedImageError(Exception):
@@ -88,6 +89,8 @@ def load() -> frozenset[Path]:
             raw_text = fh.read()
     except FileNotFoundError:
         return frozenset()
+    except OSError as exc:
+        raise BlacklistError(f'blacklist store cannot be read: {path}: {exc}') from exc
     except UnicodeDecodeError as exc:
         raise BlacklistError(f'blacklist store is not valid UTF-8: {path}') from exc
 
@@ -114,43 +117,86 @@ def is_blocked(path: Path | str, blocked: AbstractSet[Path] | None = None) -> bo
 
 def _write_atomic(blocked: AbstractSet[Path]) -> None:
     cache_dir = cache.cache_root()
-    cache_dir.mkdir(parents=True, exist_ok=True)
     doc = {'version': _VERSION, 'paths': sorted(str(p) for p in blocked)}
-    fd, tmp_name = tempfile.mkstemp(dir=cache_dir, prefix='.blacklist-')
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=cache_dir, prefix='.blacklist-')
+    except OSError as exc:
+        raise BlacklistError(f'cannot create blacklist temp file: {exc}') from exc
+    try:
+        try:
+            fh = os.fdopen(fd, 'w', encoding='utf-8')
+        except OSError:
+            # mkstemp() returned a raw descriptor, and fdopen() did not
+            # take ownership because it failed. Close it before the
+            # outer handler unlinks the temporary pathname.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        with fh:
             json.dump(doc, fh)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, _store_path())
-    except Exception:
+    except OSError as exc:
         try:
             os.unlink(tmp_name)
-        except FileNotFoundError:
+        except OSError:
+            # Not narrowed to FileNotFoundError: *any* failure to remove
+            # the temp file (permissions, a second concurrent cleanup,
+            # whatever) must be swallowed here, not raised. The exception
+            # this function is about to raise is the one that matters --
+            # the original write failure -- and letting an unrelated
+            # unlink failure escape instead would replace that diagnostic
+            # with a misleading one about a leftover temp file, not fix
+            # anything the caller could act on differently.
             pass
-        raise
+        raise BlacklistError(f'cannot write blacklist store: {exc}') from exc
 
 
 def _update(normalized: Path, *, adding: bool) -> bool:
     cache_dir = cache.cache_root()
-    cache_dir.mkdir(parents=True, exist_ok=True)
     lock_path = _lock_path()
-    with open(lock_path, 'a+') as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, 'a+')
+    except OSError as exc:
+        raise BlacklistError(f'cannot open blacklist lock file: {exc}') from exc
+
+    try:
         try:
-            current = load()
-            if adding:
-                if normalized in current:
-                    return False
-                updated = current | {normalized}
-            else:
-                if normalized not in current:
-                    return False
-                updated = current - {normalized}
-            _write_atomic(updated)
-            return True
-        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise BlacklistError(f'cannot lock blacklist store: {exc}') from exc
+
+        current = load()
+        if adding:
+            if normalized in current:
+                return False
+            updated = current | {normalized}
+        else:
+            if normalized not in current:
+                return False
+            updated = current - {normalized}
+        _write_atomic(updated)
+        return True
+    finally:
+        # Best-effort only, deliberately not raising BlacklistError here:
+        # by this point the operation above has already succeeded or
+        # already raised on its own terms, and closing lock_fh releases
+        # the OS-held flock() regardless of whether LOCK_UN itself
+        # succeeds -- so a failure in either of these two calls must be
+        # ignored, never allowed to mask or overwrite that outcome.
+        try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
 
 
 def add(path: Path | str) -> bool:
@@ -161,6 +207,30 @@ def add(path: Path | str) -> bool:
 def remove(path: Path | str) -> bool:
     normalized = _normalize(path)
     return _update(normalized, adding=False)
+
+
+def remove_stored(raw: str) -> bool:
+    """Remove an entry by its exact stored string, bypassing _normalize().
+
+    For the restore endpoint, whose only inputs are strings load() itself
+    just returned. Skips _normalize()'s live root-containment check --
+    restore only ever narrows the blocked set, so re-validating an entry
+    against the *current* configured roots would resurrect the Step 1
+    remove() gap: an entry under a root that has since been reconfigured
+    away, or is presently offline, would become unrestorable even though
+    load() and is_blocked() both still see it correctly. _validate_stored_entry
+    still rejects a string that could never have come out of load() in
+    the first place (malformed, non-canonical, wrong suffix) -- it just
+    does so without touching cache.configured_image_roots(), so a
+    never-valid string returns False instead of raising, and a
+    genuinely corrupt store still raises BlacklistError via the load()
+    inside _update(), which this does not swallow.
+    """
+    try:
+        candidate = _validate_stored_entry(raw)
+    except BlacklistError:
+        return False
+    return _update(candidate, adding=False)
 
 
 def load_if_configured() -> frozenset[Path]:

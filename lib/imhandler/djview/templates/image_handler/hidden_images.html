@@ -1,0 +1,45 @@
+{% extends 'image_handler/base.html' %}
+{% block content %}
+<style>
+  .hi-table { border-collapse: collapse; }
+  .hi-table th, .hi-table td { padding: 0.4em 0.9em; text-align: left; vertical-align: middle; border-bottom: 1px solid #e0e0e0; }
+  .hi-table th { font-size: 0.85em; color: #555; font-weight: normal; }
+  .hi-table td.path { word-break: break-all; }
+  .hi-missing { color: #a00; font-size: 0.85em; }
+  .hi-empty { color: #888; font-style: italic; }
+  .hi-restore-btn {
+    font-size: 0.85em; padding: 0.2em 0.6em; cursor: pointer;
+    border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;
+  }
+  .hi-restore-btn:hover { background: #e8e8e8; }
+</style>
+
+{% if entries %}
+<table class="hi-table">
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+    <tr>
+      <td class="path">{{ e.path }}</td>
+      <td>{% if not e.exists %}<span class="hi-missing">missing</span>{% endif %}</td>
+      <td>
+        <form method="post" action="{% url 'image_handler:restore_image' %}">
+          {% csrf_token %}
+          <input type="hidden" name="path" value="{{ e.path }}">
+          <button type="submit" class="hi-restore-btn">Show again</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="hi-empty">No images are currently hidden.</p>
+{% endif %}
+{% endblock %}
