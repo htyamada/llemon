@@ -1230,6 +1230,1192 @@ hidden. Step 3 is also where Step 1's known `remove()` limitation (an entry
 outside the currently configured roots cannot be removed) becomes a product
 question, since restore is the operation it blocks.
 
+**Why this order:** every sub-step below reads from real, current code
+(`lib/imhandler/djview/__init__.py`, `urls.py`, `views.py`, and the
+`cluster_detail.html`/`similar.html` templates), so the design fixes exact
+line references rather than describing the shape of a rewrite. Sub-steps run
+authorization and the shared library addition first, since the endpoints and
+the templates that call them both depend on those; the two media endpoints
+(`image`/`thumb`) are independent of the mutation endpoints and can land in
+parallel; template/UI work comes last because it is the only part that needs
+the endpoints to already exist.
+
+**Sub-steps,** each separately compilable and testable, in dependency order:
+(3a) one addition and one latent-bug fix to `blacklist.py`; (3b)
+authorization; (3c) the three endpoints and their routes; (3d) `image`/`thumb`
+enforcement; (3e) `cluster_detail`; (3f) `similar`; (3g) shared modal, Hidden
+images template, and nav; (3h) removing the old Mark/deletion-list code; (3i)
+tests.
+
+**Design.**
+
+- **3a — one addition to `blacklist.py` (`remove_stored`) and one
+  latent-bug fix (normalizing filesystem errors to `BlacklistError`).**
+  First, `remove_stored`. This is the
+  concrete resolution of Step 1's known `remove()` gap, not just a
+  restatement of it. `remove()` calls `_normalize()`, which re-validates
+  root containment against the *currently* configured `image_roots` — right
+  for `add()`, since hiding an unreachable path makes no sense, but wrong
+  for restore: an entry can legitimately be listed and blocked (`load()`
+  and `is_blocked()` both still see it) while no longer validating under
+  `_normalize()`, because its root was reconfigured away or is presently
+  offline. A restore endpoint that reused `remove()` would 400 on exactly
+  the entries an operator most needs to restore.
+
+  The fix is not to relax `_normalize()` — that would reopen add-time
+  validation for a case it exists to close — but to recognize that restore
+  never needs it in the first place. The Hidden images page's only source
+  of input is `load()`'s own output: every string the restore form can ever
+  submit is one `load()` just produced, which means it already passed
+  `_validate_stored_entry()` (Step 1's *structural*, config-independent
+  canonical-form check: absolute, no NUL, canonical `normpath`, no
+  non-canonical leading `//`, correct suffix — everything except live root
+  containment). Restore only needs to confirm the submitted string is
+  still exactly a member of the current set; it never needs to ask whether
+  that string is a path someone could *newly* add today.
+
+  ```python
+  def remove_stored(raw: str) -> bool:
+      """Remove an entry by its exact stored string, bypassing _normalize().
+
+      For the restore endpoint, whose only inputs are strings load() itself
+      just returned. Skips _normalize()'s live root-containment check --
+      restore only ever narrows the blocked set, so re-validating an entry
+      against the *current* configured roots would resurrect the Step 1
+      remove() gap: an entry under a root that has since been reconfigured
+      away, or is presently offline, would become unrestorable even though
+      load() and is_blocked() both still see it correctly. _validate_stored_entry
+      still rejects a string that could never have come out of load() in
+      the first place (malformed, non-canonical, wrong suffix) -- it just
+      does so without touching cache.configured_image_roots(), so a
+      never-valid string returns False instead of raising, and a
+      genuinely corrupt store still raises BlacklistError via the load()
+      inside _update(), which this does not swallow.
+      """
+      try:
+          candidate = _validate_stored_entry(raw)
+      except BlacklistError:
+          return False
+      return _update(candidate, adding=False)
+  ```
+
+  A malformed or already-absent `raw` is a silent no-op (matching `remove()`'s
+  own idempotency contract), never an error; only a corrupt on-disk store
+  (raised from `load()` inside `_update()`) propagates. `remove_stored` never
+  calls the filesystem beyond `blacklist.json` itself, so a hand-crafted POST
+  that doesn't match any stored entry can do nothing worse than a no-op —
+  there is no injection surface here worth defending against beyond that.
+
+  **The same sub-step also fixes a latent Step 1/2 bug this design exposes:
+  `load()` and `_update()` only convert specific, anticipated failures into
+  `BlacklistError`** (`FileNotFoundError`, `json.JSONDecodeError`, the
+  structural checks) **and let any other `OSError` — a permission error
+  opening `blacklist.json` or the lock file, a read-only `cache_dir` — pass
+  through unconverted.** Every caller in this document, from Step 2's
+  `imh`'s `_blocked_snapshot` (which only catches `blacklist.BlacklistError`
+  before printing a clean message and exiting nonzero) through this step's
+  own `image`/`thumb`/`hidden_images`, is written to expect `BlacklistError`
+  as the one exception type that means "the blacklist could not be
+  consulted." A raw `PermissionError` defeats that contract at every one of
+  those sites simultaneously, producing an unhandled traceback (a raw
+  Django 500, or an unfiltered CLI stack trace) instead of the fail-closed
+  behavior section 1.6 specifies — worth fixing once, here, at the source,
+  rather than adding a matching `except OSError` at every call site this
+  step and Step 2 already wrote. `load()`:
+  ```python
+  def load() -> frozenset[Path]:
+      path = _store_path()
+      try:
+          with open(path, 'r', encoding='utf-8') as fh:
+              raw_text = fh.read()
+      except FileNotFoundError:
+          return frozenset()
+      except OSError as exc:
+          raise BlacklistError(f'blacklist store cannot be read: {path}: {exc}') from exc
+      except UnicodeDecodeError as exc:
+          raise BlacklistError(f'blacklist store is not valid UTF-8: {path}') from exc
+      ...
+  ```
+  (`FileNotFoundError` is itself an `OSError` subclass, so it must stay the
+  first, more specific `except`.)
+
+  **Every filesystem call on the write path needs the same treatment, not
+  only the ones already anticipated** — this is worth being exhaustive
+  about, since the entire point of this fix is "one exception type, no
+  exceptions to that rule." `_write_atomic()`'s cleanup-on-failure path is
+  itself a filesystem call and can itself fail:
+  ```python
+  def _write_atomic(blocked: AbstractSet[Path]) -> None:
+      cache_dir = cache.cache_root()
+      doc = {'version': _VERSION, 'paths': sorted(str(p) for p in blocked)}
+      try:
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          fd, tmp_name = tempfile.mkstemp(dir=cache_dir, prefix='.blacklist-')
+      except OSError as exc:
+          raise BlacklistError(f'cannot create blacklist temp file: {exc}') from exc
+      try:
+          try:
+              fh = os.fdopen(fd, 'w', encoding='utf-8')
+          except OSError:
+              # mkstemp() returned a raw descriptor, and fdopen() did not
+              # take ownership because it failed. Close it before the
+              # outer handler unlinks the temporary pathname.
+              try:
+                  os.close(fd)
+              except OSError:
+                  pass
+              raise
+          with fh:
+              json.dump(doc, fh)
+              fh.flush()
+              os.fsync(fh.fileno())
+          os.replace(tmp_name, _store_path())
+      except OSError as exc:
+          try:
+              os.unlink(tmp_name)
+          except OSError:
+              # Not narrowed to FileNotFoundError: *any* failure to remove
+              # the temp file (permissions, a second concurrent cleanup,
+              # whatever) must be swallowed here, not raised. The exception
+              # this function is about to raise is the one that matters --
+              # the original write failure -- and letting an unrelated
+              # unlink failure escape instead would replace that diagnostic
+              # with a misleading one about a leftover temp file, not fix
+              # anything the caller could act on differently.
+              pass
+          raise BlacklistError(f'cannot write blacklist store: {exc}') from exc
+  ```
+  `_update()`'s lock handling needs the equivalent for both ends of the
+  lock, not just acquiring the lock file itself. `cache_dir.mkdir(...)` and
+  `open(lock_path, 'a+')` becoming `BlacklistError` was already specified
+  above; `fcntl.flock()` can independently raise `OSError` on *both* the
+  exclusive-lock acquisition and the unlock, and the two need different
+  treatment, not the same `except OSError: raise BlacklistError` reflex
+  applied twice: a failed *acquisition* means the critical section never
+  ran at all, so it must raise (the caller's `add()`/`remove()` genuinely
+  did nothing and needs to know that); a failed *release*, in contrast, is
+  reached only after `_write_atomic()` has already returned successfully —
+  the operation is done — and closing `lock_fh` immediately afterward
+  releases any OS-held `flock()` on that descriptor regardless of whether
+  the explicit `LOCK_UN` call itself succeeded, so raising from a failed
+  unlock would report a real success as a failure and give the caller
+  nothing correct to retry:
+  ```python
+  def _update(normalized: Path, *, adding: bool) -> bool:
+      cache_dir = cache.cache_root()
+      lock_path = _lock_path()
+      try:
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          lock_fh = open(lock_path, 'a+')
+      except OSError as exc:
+          raise BlacklistError(f'cannot open blacklist lock file: {exc}') from exc
+
+      try:
+          try:
+              fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+          except OSError as exc:
+              raise BlacklistError(f'cannot lock blacklist store: {exc}') from exc
+
+          current = load()
+          if adding:
+              if normalized in current:
+                  return False
+              updated = current | {normalized}
+          else:
+              if normalized not in current:
+                  return False
+              updated = current - {normalized}
+          _write_atomic(updated)
+          return True
+      finally:
+          # Best-effort only, deliberately not raising BlacklistError here:
+          # by this point the operation above has already succeeded or
+          # already raised on its own terms, and closing lock_fh releases
+          # the OS-held flock() regardless of whether LOCK_UN itself
+          # succeeds -- so a failure in either of these two calls must be
+          # ignored, never allowed to mask or overwrite that outcome.
+          try:
+              fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+          except OSError:
+              pass
+          try:
+              lock_fh.close()
+          except OSError:
+              pass
+  ```
+  `BlacklistError`'s docstring widens from "the blacklist store exists but
+  is corrupt or unsupported" to "...corrupt, unsupported, or cannot be
+  read/written because of a filesystem error" to match. `cache.cache_root()`
+  raising plain `EnvironmentError` for an *entirely unconfigured* `cache_dir`
+  is deliberately left alone — that is a distinct, already-correct condition
+  (`load_if_configured()` already treats it as the one sanctioned fail-open,
+  Step 2, 2a), not a store I/O failure, and must not be swallowed into
+  `BlacklistError`. `tests/test_imhandler_blacklist.py` gains
+  `mock.patch('builtins.open', side_effect=PermissionError(...))`-style
+  cases for `load()`, `add()`/`remove()`/`remove_stored()` (lock-open
+  failure), a `mock.patch('os.unlink', side_effect=PermissionError(...))`
+  case that fails a write *and* its own cleanup unlink simultaneously
+  (asserting `BlacklistError` from the original write failure is what
+  surfaces, not the unlink's `PermissionError` — the direct regression test
+  for the fix above), and a `mock.patch('fcntl.flock', side_effect=...)`
+  pair covering both a failed acquisition (asserting `add()`/`remove()`
+  raise `BlacklistError` and the store is unchanged) and a failed release
+  (asserting `add()`/`remove()` still return their normal result and the
+  store *is* correctly updated, proving the swallowed `LOCK_UN` failure
+  didn't discard a real success).
+
+- **3b — authorization.** Section 1.6 specifies "an authenticated staff
+  user" by default with an `IMHANDLER_BLACKLIST_AUTHORIZER` override —
+  `lib/documentview/config.py`'s `DOCUMENT_VIEWER_AUTHORIZE(request, action)`
+  is the precedent already in this repo, but imhandler's blacklist has only
+  one gated action (manage: hide/list/restore together, per section 1.6's
+  own wording), so the hook takes just `request`:
+
+  ```python
+  # lib/imhandler/djview/__init__.py, near _get_roots()
+  def _default_blacklist_authorizer(request) -> bool:
+      user = getattr(request, 'user', None)
+      return bool(user is not None and user.is_authenticated and user.is_staff)
+
+  def _can_manage_blacklist(request) -> bool:
+      hook = getattr(settings, 'IMHANDLER_BLACKLIST_AUTHORIZER', _default_blacklist_authorizer)
+      return bool(hook(request))
+  ```
+
+  Add `from django.conf import settings` and `from imhandler import blacklist`
+  to the existing top-level import block (`lib/imhandler/djview/__init__.py:20-32`);
+  unlike the library modules imported function-locally throughout this file
+  to dodge circular imports (`imhandler.clusterer`, `imhandler.db`,
+  `imhandler.embedder`), `blacklist` has no import-cycle with `djview`, so a
+  top-level import is simplest and matches `appconfig`/`cache`'s existing
+  top-level treatment.
+
+  **This default silently disables the feature for llime.**
+  `llime/config/settings.py:152-154` already documents why:
+  `_authorize_document_viewer` returns `True` unconditionally because "llime
+  is authenticated by the web server, outside Django" — there is no real
+  Django-session staff user in that deployment, so `_default_blacklist_authorizer`
+  would return `False` for every request and Hide/Restore/Hidden-images would
+  403 for everyone. This is not a hypothetical edge case to note for later;
+  it is the actual configuration of the repo's own primary consumer, so this
+  sub-step must also add, right next to `DOCUMENT_VIEWER_AUTHORIZE` in
+  `llime/config/settings.py`, a **one-argument wrapper** — not a direct
+  assignment. `_authorize_document_viewer(request, action)` takes two
+  positional arguments; `IMHANDLER_BLACKLIST_AUTHORIZER` is called as
+  `hook(request)` (one argument, per 3b's `_can_manage_blacklist` above), so
+  `IMHANDLER_BLACKLIST_AUTHORIZER = _authorize_document_viewer` would raise
+  `TypeError: _authorize_document_viewer() missing 1 required positional
+  argument: 'action'` on the very first Hide/Restore/Hidden-images request —
+  not merely fail to authorize, but crash the endpoint outright:
+  ```python
+  def _authorize_imhandler_blacklist(request):
+      """Same reasoning as _authorize_document_viewer: llime is authenticated
+      by the web server, outside Django. Wrapped rather than assigned
+      directly because that hook takes (request, action) and this one is
+      called with (request) alone."""
+      return _authorize_document_viewer(request, 'blacklist')
+
+  IMHANDLER_BLACKLIST_AUTHORIZER = _authorize_imhandler_blacklist
+  ```
+  This still reuses `_authorize_document_viewer`'s actual logic (and, via its
+  docstring, its rationale) rather than duplicating an unconditional `return
+  True` a second time with no explanation. `../qat/knip` runs real `django.contrib.auth`
+  with no override configured today, so the staff-only default applies
+  there unchanged; Step 5's rollout note should confirm knip has at least
+  one staff account before Hide ships, since otherwise the feature is present
+  but unreachable there for a different reason (no staff user exists) than
+  in llime (the authorizer always says no).
+
+  **Reading "authorized users can view blacklisted files" correctly.** The
+  document's opening paragraph and section 1.6 both use "view"/"authorized
+  users can view" language that could be misread as image/thumb making an
+  exception for staff. They do not, anywhere in sections 1.2/1.6/2.4: a
+  blocked image 404s unconditionally, for every requester. What section 1.3
+  actually grants authorized users is visibility into the *blacklist itself*
+  — the Hidden images page shows path and existence status, explicitly
+  *without* thumbnails ("media endpoints deliberately block them"). No
+  sub-step below adds a staff bypass to `image`/`thumb`; this is called out
+  because it is exactly the kind of implicit exception a first implementation
+  pass could plausibly add by accident while wiring up authorization.
+
+- **3c — the three endpoints.** `hide_image` and `restore_image` are added
+  as `@staticmethod`s (matching `mark_toggle`/`thumb`/`image`'s existing
+  convention) and *must* stay static: `require_POST` (from
+  `django.views.decorators.http.require_http_methods`) wraps a plain
+  `def view(request, *args, **kwargs)` and reads `request` as its first
+  positional argument. Applied to an unbound instance method
+  (`def hide_image(self, request):`) inside the class body, the decorator
+  would instead receive `self` as that first argument and check `self.method`
+  — which doesn't exist — rather than `request.method`; `@staticmethod`
+  strips `self` entirely before `require_POST` ever sees the function, the
+  same reason `embed_cancel` (`__init__.py:839-840`) is static under its own
+  `@csrf_exempt`. `hidden_images` is the one exception: it needs
+  `self._ctx()`/`self._t()` for nav rendering like every other page view, so
+  it stays an instance method and is not decorated with `require_POST` (a
+  `GET` listing page has no method to restrict). `require_POST` is imported
+  at `lib/imhandler/djview/__init__.py:25` today but never used — `hide_image`
+  and `restore_image` are its first callers. CSRF protection itself is the
+  Django middleware default and needs no decorator, matching
+  `mark_toggle`/`deletion_list_clear` today.
+
+  ```python
+  @staticmethod
+  @require_POST
+  def hide_image(request):
+      if not _can_manage_blacklist(request):
+          return JsonResponse({'error': 'Forbidden'}, status=403)
+      path = request.POST.get('path', '')
+      if not path:
+          return JsonResponse({'error': 'No path given'}, status=400)
+      try:
+          blacklist.add(path)
+      except ValueError as e:
+          return JsonResponse({'error': str(e)}, status=400)
+      except (blacklist.BlacklistError, EnvironmentError) as e:
+          return JsonResponse({'error': str(e)}, status=500)
+      return JsonResponse({'ok': True})
+
+  @staticmethod
+  @require_POST
+  def restore_image(request):
+      if not _can_manage_blacklist(request):
+          return HttpResponse(status=403)
+      path = request.POST.get('path', '')
+      if path:
+          try:
+              blacklist.remove_stored(path)
+          except (blacklist.BlacklistError, EnvironmentError) as e:
+              return HttpResponse(f'Cannot update the blacklist: {e}',
+                                   status=500, content_type='text/plain; charset=utf-8')
+      return redirect(_url('hidden_images'))
+
+  def hidden_images(self, request):
+      if not _can_manage_blacklist(request):
+          return render(request, self._t('error.html'), self._ctx({
+              'title': 'Hidden images', 'message': 'Not authorized.', 'detail': '',
+          }), status=403)
+      try:
+          blocked = blacklist.load()
+      except (blacklist.BlacklistError, EnvironmentError) as e:
+          return render(request, self._t('error.html'), self._ctx({
+              'title': 'Hidden images',
+              'message': 'Cannot read the blacklist.',
+              'detail': str(e),
+          }), status=500)
+      entries = [{'path': str(p), 'exists': p.is_file()} for p in sorted(blocked)]
+      return render(request, self._t('hidden_images.html'), self._ctx({
+          'title': 'Hidden images', 'entries': entries,
+      }))
+  ```
+
+  `hide_image` returns `{'ok': True}` on both the changed and
+  already-idempotent case (`blacklist.add`'s boolean return is not
+  surfaced) — the client only needs to know the path is no longer visible,
+  matching section 1.3's "adding an existing entry is idempotent." It is
+  JSON because the shared modal (3g) calls it via `fetch`, exactly as
+  `mark_toggle` used to be.
+
+  **`restore_image` is deliberately *not* JSON, unlike `hide_image`.** Its
+  only caller is a plain HTML `<form>` on the Hidden images page (3g) — a
+  normal, non-JS form submission navigates the browser directly to whatever
+  the response is, so a `JsonResponse` here would leave the user staring at
+  raw `{"ok": true}` text instead of back on the Hidden images page. It
+  follows the same shape `deletion_list_clear` already used
+  (`__init__.py:393-398`: `return redirect(...)` after a plain POST) rather
+  than the JSON shape of the two endpoints meant for `fetch`. A missing
+  `path`, like `deletion_list_clear`'s tolerance of a missing `next`, is not
+  an error worth surfacing — it silently redirects back with nothing
+  changed, matching `remove_stored`'s own idempotent-no-op-on-absent
+  contract from 3a. A genuine failure (corrupt store, unconfigured
+  `cache_dir`) returns a plain-text 500 rather than a rendered `error.html`,
+  since `restore_image` is a `@staticmethod` (required so `@require_POST`
+  wraps a plain `(request)` signature rather than an unbound `(self,
+  request)` — see 3c's opening paragraph) and so has no `self._ctx()`/`self._t()`
+  available; a rare, staff-only failure page does not need the app's nav
+  chrome to be useful.
+
+  `hidden_images` (an instance method, unlike the two mutation endpoints —
+  it needs `self._ctx()`/`self._t()` for nav rendering) catches
+  `EnvironmentError` too (unconfigured `cache_dir`/`image_root`), the same
+  pattern every other page view in this file already uses for
+  `open_db()`/`_get_roots()` failures, rather than inventing a second
+  convention for this one view.
+
+  Routes (`lib/imhandler/djview/urls.py:17-19` currently hold the three
+  Mark/deletion-list routes being replaced):
+  ```python
+  path('hide/', views.hide_image, name='hide_image'),
+  path('hidden/', views.hidden_images, name='hidden_images'),
+  path('restore/', views.restore_image, name='restore_image'),
+  ```
+  and `lib/imhandler/djview/views.py:23-25`'s three aliases become
+  `hide_image = _vs.hide_image`, `hidden_images = _vs.hidden_images`,
+  `restore_image = _vs.restore_image`.
+
+- **3d — `image`/`thumb` enforcement.** `image()` (`__init__.py:691-729`)
+  has no blacklist check at all today — section 2.4's "Intermediate state"
+  note already flags this as the one surface Step 2 could not close. Add,
+  immediately after the existing `path.is_file()` check and *before*
+  `last_modified = path.stat().st_mtime` (the ordering section 2.4 requires,
+  identical to `thumb`'s existing comment at `__init__.py:677-680`):
+  ```python
+  try:
+      blocked = blacklist.load_if_configured()
+  except blacklist.BlacklistError:
+      return _not_found('Image not found')
+  if path in blocked:
+      return _not_found('Image not found')
+  ```
+  Both the corrupt-store and the blocked case return the identical message
+  and status through `_not_found()` (section 1.6: never reveal source-file
+  existence, and `_not_found()` already stamps `Cache-Control: no-store` at
+  `__init__.py:152-162`, so nothing new is needed there) — a corrupt store
+  fails closed exactly like a blocked entry, rather than a 500 that would
+  distinguish the two cases for an unauthenticated caller.
+
+  `thumb()` (`__init__.py:644-689`) already blocks correctly today, but only
+  because its `except Exception:` at line 671 happens to also catch
+  `blacklist.BlockedImageError` raised from inside `get_or_create` — the
+  comment at lines 672-675 says as much. Replace the accident with an
+  explicit pre-check using the same snapshot passed into `get_or_create`,
+  so one `load_if_configured()` call serves both the check and the
+  downstream filtering (matching Step 2's "Snapshot consistency" principle
+  rather than loading twice):
+  ```python
+  try:
+      blocked = blacklist.load_if_configured()
+  except blacklist.BlacklistError:
+      return _not_found('Image not found')
+  if path in blocked:
+      return _not_found('Image not found')
+  ...
+  try:
+      thumb_path = get_or_create(entry, long_edge=size, blocked=blocked)
+  except EnvironmentError as e:
+      return _not_found(f'Cache unavailable: {e}')
+  except Exception:
+      return _not_found('Thumbnail generation failed')
+  ```
+  The remaining bare `except Exception` now only ever means "thumbnailing
+  itself failed" — a decode error, a permissions problem — not "hidden",
+  which is what "an explicit pre-check rather than a caught exception" in
+  this step's opening paragraph means concretely: policy and implementation
+  failure are no longer reported through the same catch-all.
+
+- **3e — `cluster_detail`.** `get_cluster_members()` already defaults to
+  `load_if_configured()` and drops blocked rows (Step 2, `db.py`), so a
+  member appearing in this view's `rows`/`members` was never blocked to
+  begin with — there is no "already hidden" state to render here, unlike
+  the old Mark/Unmark toggle. Delete `marked_set` (`__init__.py:333`), the
+  `'marked': row['path'] in marked_set` field (line 351), and
+  `deletion_count` (line 358) from the context; delete `mark_toggle`,
+  `deletion_list_download`, `deletion_list_clear` (`__init__.py:364-398`)
+  entirely — nothing else in the view references them once the template
+  stops calling `mark_toggle`.
+
+  **A server-side "fewer than two visible members" check is required here,
+  not only the client-side one below.** `get_cluster_members`'s own
+  docstring already states the gap precisely (`db.py:125-128`): "A cluster
+  whose members are all blocked returns an empty list, the same shape as
+  'no such cluster' -- callers that must tell those apart check row
+  existence before calling this, not after." `cluster_detail` does not do
+  that today, and the *partially*-blocked case is worse than the docstring's
+  fully-blocked example: take a two-member cluster where one member was
+  hidden a moment ago from another tab, by the CLI, or by a different staff
+  user — not through this page's own modal. `rows = get_cluster_members(conn,
+  cluster_id)` (`__init__.py:315`) already excludes it, so `rows` has length
+  1; `if not rows: raise Http404(...)` (line 317) does not fire, since 1 is
+  truthy; `cleanup_missing_members` (line 321) is deliberately
+  blacklist-blind (`db.py:158-165` — it must not treat a hidden-but-present
+  file as "missing," or a plain page view would delete cluster metadata for
+  an image the user only hid) and so still counts the hidden member as
+  present, leaving `remaining == 2` and the `remaining <= 1` collapse (line
+  322) never firing either. The page renders with exactly one visible row —
+  precisely the state section 1.3 says must instead redirect to Compare, and
+  this can happen on a plain `GET` with no Hide click in this browser tab at
+  all, so the client-side DOM-count check in this same sub-step cannot catch
+  it.
+
+  Fix by checking `len(rows) < 2` immediately after computing `rows` (before
+  running `cleanup_missing_members` at all), distinguishing "no such cluster"
+  from "cluster exists but is down to 0 or 1 visible members" with one cheap
+  existence query — exactly the check `get_cluster_members`'s docstring asks
+  callers to do "before calling this, not after." **That single check is not
+  enough by itself, though**, because `rows` is only blocked-filtered, and
+  `cleanup_missing_members` can shrink the visible count *further* without
+  ever touching `rows` again: take a three-member cluster with A hidden, B
+  missing from disk, C visible and present. `rows` (blocked-filtered) is
+  `[B, C]` — length 2, so the upfront check does not fire. `cleanup_missing_members`
+  is blacklist-blind by design (`db.py:158-165`), so it counts `[A, B, C]`,
+  finds only `B` missing, deletes it, and returns `remaining = 3 - 1 = 2` —
+  which also does not trigger the existing `remaining <= 1` collapse. The
+  page then builds `members` from `rows` minus `missing_ids` (`{B}`), leaving
+  exactly `[C]`: one visible row rendered, with neither check having caught
+  it. `remaining` and "visible row count" are answering two different
+  questions — `remaining` is blacklist-blind on purpose, so it must stay
+  that way for the *DB-collapse* decision (deleting `Clusters`/`ClusterMembership`
+  rows only because real files are gone, never because of hiding) — and
+  conflating them was the bug. A **second**, blacklist-*aware* check is
+  needed after `missing_ids` is known, computed from the same `rows` the
+  page is about to render from:
+  ```python
+  try:
+      rows = get_cluster_members(conn, cluster_id)
+  except blacklist.BlacklistError as e:
+      conn.close()
+      return render(request, self._t('error.html'), self._ctx({
+          'title': 'Cluster', 'message': 'Cannot read the blacklist.', 'detail': str(e),
+      }), status=500)
+
+  if len(rows) < 2:
+      cluster_exists = conn.execute(
+          'SELECT 1 FROM Clusters WHERE id = ?', (cluster_id,)
+      ).fetchone() is not None
+      conn.close()
+      if not cluster_exists:
+          raise Http404('Cluster not found')
+      return redirect(_url('compare'))
+
+  missing_ids, remaining = cleanup_missing_members(conn, cluster_id)
+  if remaining <= 1:
+      # Existing behavior, unchanged: too few *real files* left, regardless
+      # of blacklist status -- collapse the cluster's DB rows entirely.
+      conn.execute('DELETE FROM ClusterMembership WHERE cluster_id = ?', (cluster_id,))
+      conn.execute('DELETE FROM Clusters WHERE id = ?', (cluster_id,))
+      conn.commit()
+      conn.close()
+      return redirect(_url('compare'))
+
+  missing_id_set = set(missing_ids)
+  visible_rows = [r for r in rows if r['image_id'] not in missing_id_set]
+  if len(visible_rows) < 2:
+      # Blacklist-aware, unlike `remaining` above: rows is already
+      # blocked-filtered, so this catches "too few members are actually
+      # displayable" without deleting anything -- the cluster may still be
+      # a real pair once the hidden member is restored, and restoring must
+      # not require re-creating destroyed Cluster/ClusterMembership rows.
+      conn.close()
+      return redirect(_url('compare'))
+
+  conn.close()
+  ...
+  # `members` is now built directly from `visible_rows`, which already
+  # excludes both blocked and missing entries -- the old
+  # `if row['image_id'] in missing_id_set: continue` guard inside the loop
+  # is no longer needed, since visible_rows was filtered before the loop.
+  ```
+  A cluster ID that never existed still gets `rows == []` at the first check
+  and resolves to the direct `SELECT` finding nothing, so it still 404s as
+  "Cluster not found" rather than silently redirecting to Compare — the
+  fully-blocked case is no longer indistinguishable from "no such cluster,"
+  closing both halves of the docstring's own warning, not just the one this
+  document's "Intermediate state" section originally flagged as an accepted
+  rough edge. The two-member "one hidden, one present" case from the
+  existing Step 2 test (below) is still caught by the *first* check alone
+  (`rows` is already `[C]`, length 1); the second check exists specifically
+  for the three-member case above, where blocking alone doesn't shrink `rows`
+  below 2 but shrinks it below 2 once the independently-missing member is
+  also excluded. Note that the `try/except blacklist.BlacklistError` shown
+  above around `get_cluster_members()` is a *separate* block from the
+  existing `try/except EnvironmentError` around `open_db()`
+  (`__init__.py:306-313`), not merged into it — `open_db()` can only raise
+  `EnvironmentError`, `get_cluster_members()` can only raise
+  `BlacklistError`, and giving each its own `except` lets the rendered
+  message stay precise ("Cannot open image database." vs. "Cannot read the
+  blacklist.") instead of one generic message covering two unrelated
+  failures. This is the "rendered error page for a corrupt store" the intro
+  paragraph calls out as one of the surfaces Step 2 left unreached (today an
+  uncaught `BlacklistError` would surface as a bare Django 500, not the
+  app's own `error.html`).
+
+  **This changes the expected result of an existing Step 2 test.**
+  `tests/test_djview.py:344-364`
+  (`test_hidden_but_present_member_does_not_delete_cluster`) hides one
+  member of a two-member cluster and asserts `response.status_code == 200`
+  with both memberships still in the database. Per the fix above, that
+  exact scenario (2 members, 1 hidden, 1 visible) now redirects to Compare
+  (`302`) instead of rendering — but it must still leave the `Clusters` and
+  `ClusterMembership` rows untouched, since this new `len(rows) < 2` branch
+  never runs a `DELETE`, only the (unrelated, unchanged) `remaining <= 1`
+  branch does that, and that branch is never reached here. Update this test
+  to assert the redirect (`302`, `Location` pointing at `compare/`) while
+  keeping its real invariant — the two `ClusterMembership` rows and the
+  `Clusters` row still present — intact; the test's own docstring ("must
+  never destroy cluster metadata just because one of its members is
+  hidden") was always about the DB rows, not the status code, so this is a
+  correction to an incidental assertion, not a weakening of what the test
+  actually guards.
+
+  In `cluster_detail.html`: replace the Mark/Unmark button (lines 85-89, and
+  its `.mark-btn`/`.mark-btn.marked`/`tr.is-marked` CSS at lines 14, 23-29)
+  with a single Hide button carrying the data the shared modal needs, shown
+  only to a user who can actually use it — section 1.6: "hiding buttons is
+  not sufficient" for authorization, but that is a floor, not a reason to
+  skip the UX of not showing a control that will just 403:
+  ```html
+  {% if can_manage_blacklist %}
+  <button class="hide-btn" data-path="{{ m.path }}"
+          data-thumb="{{ m.thumb_url }}" data-name="{{ m.name }}">Hide</button>
+  {% endif %}
+  ```
+  which needs `'can_manage_blacklist': _can_manage_blacklist(request)` added
+  to this view's context alongside the other template variables
+  (`__init__.py:354-362`); the shared modal include at the bottom of the
+  template (3g) is wrapped in the same `{% if can_manage_blacklist %}` so an
+  unauthorized viewer's page carries neither the button nor the modal's
+  markup/CSRF form. Remove the `#del-bar` block (lines 114-123) and its CSS
+  (lines 31-46, including the now-unnecessary `body { padding-bottom: 3em; }`),
+  the `MARK_URL`/`CSRF` constants and the `.mark-btn` click handler (lines
+  137-165) — CSRF now comes from the shared modal's own token. Wire Hide
+  buttons to the modal and implement section 1.3's "If fewer than two
+  visible cluster members remain, return to Compare" as a client-side count
+  after DOM removal too — this handles the *live*, same-tab case (hide
+  clicked just now) that the server-side check above cannot, since that
+  check only runs on a fresh `GET`.
+
+  **The `onSuccess` callback must also retire the hidden member from the
+  page's lightbox state, not only remove its table row.** The existing
+  lightbox (`cluster_detail.html:134-213`, unchanged by this step) navigates
+  by index into a `MEMBERS` array parsed once from `{{ members|json_script:
+  "member-data" }}`, and each `.cd-thumb`'s `data-idx` attribute is that
+  same index, fixed at render time. Removing only the `<tr>` leaves both of
+  those stale: `MEMBERS` still contains the hidden entry, so `lbNav()`'s
+  `(lbIdx + delta) % MEMBERS.length` wraparound can still land on it and
+  request `m.image_url` for a path that now 404s (per 3d); and every
+  `.cd-thumb` originally indexed *after* the removed one now points at the
+  wrong array slot as soon as one entry is spliced out, so clicking a
+  thumbnail that visually shifted up a row would open the neighboring
+  image instead of the one actually clicked. Fix by keeping `MEMBERS` (and
+  each thumbnail's `data-idx`) in sync with the DOM on every successful
+  hide, and by closing the lightbox defensively if it happens to be open at
+  all (it cannot legitimately be mid-hide today — the confirmation modal
+  and the lightbox are mutually exclusive overlays, since the lightbox
+  covers the Hide buttons underneath it while open — but closing
+  unconditionally is one line and removes the need to reason about it ever
+  becoming possible after a future template change):
+  ```js
+  document.querySelectorAll('.hide-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      imhandlerHideModal.open({
+        path: btn.dataset.path, thumbUrl: btn.dataset.thumb, name: btn.dataset.name,
+        onSuccess: () => {
+          const row = btn.closest('tr');
+          const idx = parseInt(row.querySelector('.cd-thumb').dataset.idx, 10);
+          row.remove();
+          if (lb.classList.contains('open')) lbClose();
+          MEMBERS.splice(idx, 1);
+          // Keep the inert JSON blob consistent too, in case anything
+          // ever re-reads it (e.g. a restored bfcache page) rather than
+          // relying solely on the live MEMBERS variable already in scope.
+          document.getElementById('member-data').textContent = JSON.stringify(MEMBERS);
+          document.querySelectorAll('.cd-thumb').forEach(el => {
+            const i = parseInt(el.dataset.idx, 10);
+            if (i > idx) el.dataset.idx = i - 1;
+          });
+          if (document.querySelectorAll('.cd-table tbody tr').length < 2) {
+            window.location.href = "{{ back_url }}";
+          }
+        },
+      });
+    });
+  });
+  ```
+  This block is placed among the Hide-button wiring (roughly where the old
+  `.mark-btn` handler was, `cluster_detail.html:141-165`), textually *before*
+  `MEMBERS`/`lb`/`lbClose` are declared further down in the same script
+  (`cluster_detail.html:136,168,190`) — that is fine, not a bug to fix: the
+  handler only runs later, on a user click, by which point the whole
+  top-level script (including those `const` declarations) has already
+  executed once, so the closure sees them normally. It is called out here
+  only so whoever implements this doesn't reflexively reorder the script
+  block looking for a reference-before-declaration error that isn't real.
+
+  The two checks are complementary, not redundant: the server-side one
+  covers a fresh request arriving already below two visible members (direct
+  URL, another tab, another user, the CLI); the client-side one covers a
+  hide happening during this page's own lifetime, which no request has
+  observed yet.
+
+- **3f — `similar`.** Section 1.1 offers Hide on both the focal and
+  closest-match images here, and section 1.3 requires that hiding either
+  updates the page without a reload; hiding the *focal* image, though,
+  removes the entire premise of the page (there is nothing left to be
+  "similar to"), so it redirects rather than leaving an empty page. Give
+  the two buttons stable IDs and the closest panel its own ID:
+  ```html
+  <button id="hide-focal" class="hide-btn" data-path="{{ path }}"
+          data-thumb="{{ thumb_url }}" data-name="{{ name }}">Hide</button>
+  ...
+  <div id="closest-panel" class="sim-panel">
+    ...
+    <button id="hide-closest" class="hide-btn" data-path="{{ closest.path }}"
+            data-thumb="{{ closest.thumb_url }}"
+            data-name="{{ closest.name }}">Hide</button>
+  </div>
+  ```
+  Wire them through one null-safe helper. The null guard is required because
+  the closest-match panel is optional, and neither button exists on the
+  server-rendered `hidden_focal` branch below:
+  ```js
+  const focalHideBtn = document.getElementById('hide-focal');
+  const closestHideBtn = document.getElementById('hide-closest');
+  const closestPanel = document.getElementById('closest-panel');
+
+  function wireHide(btn, onSuccess) {
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      imhandlerHideModal.open({
+        path: btn.dataset.path,
+        thumbUrl: btn.dataset.thumb,
+        name: btn.dataset.name,
+        onSuccess,
+      });
+    });
+  }
+
+  wireHide(focalHideBtn, () => { window.location.href = "{{ browse_url }}"; });
+  wireHide(closestHideBtn, () => {
+    if (closestPanel) {
+      closestPanel.innerHTML = '<p class="hidden-notice">Hidden.</p>';
+    }
+  });
+  ```
+  A second, server-rendered case section 1.3 requires: the *focal* image
+  can arrive already blocked (a bookmarked/stale `similar/?path=...` URL,
+  or another tab/CLI hiding it while this page is open) — today `find_similar`
+  already returns `(None, [])` for a blocked target (Step 2, 2d), but the
+  view can't currently tell that apart from "this image just has no
+  embedding yet," so it renders the same "run the embedder first" message
+  for both, which section 1.3's "replace the Similar panel with a Hidden
+  notice" asks to distinguish. Check explicitly, before calling
+  `find_similar`, using one snapshot shared with the call (again, one load
+  per request, not two):
+  ```python
+  try:
+      blocked = blacklist.load_if_configured()
+      if path in blocked:
+          return render(request, self._t('similar.html'), self._ctx({
+              'title': path.name, 'name': path.name,
+              'hidden_focal': True, 'browse_url': browse_url,
+              'can_manage_blacklist': _can_manage_blacklist(request),
+          }))
+      conn = open_db()
+      target_row, raw_neighbors = find_similar(conn, path, model, blocked=blocked)
+      conn.close()
+  except (EnvironmentError, blacklist.BlacklistError) as e:
+      return render(request, self._t('error.html'), self._ctx({
+          'title': 'Similar', 'message': 'Cannot load image data.', 'detail': str(e),
+      }), status=500)
+  ```
+  The error message is deliberately generic ("Cannot load image data.", not
+  the original "Cannot open image database.") since this one `except` now
+  covers two unrelated causes (`open_db()`'s `EnvironmentError`,
+  `load_if_configured()`'s `BlacklistError`) — `detail` still carries the
+  real exception text for whoever reads the page. `can_manage_blacklist` is
+  set on the `hidden_focal` branch too even though that branch renders no
+  Hide button itself (nothing there needs authorizing) — Django would
+  otherwise treat the missing key as falsy and skip the modal include by
+  accident rather than by an explicit decision, and passing it keeps every
+  render of this template following the same context contract.
+  In `similar.html`, wrap the existing focus/closest/neighbors markup in
+  `{% if hidden_focal %}<p>This image has been hidden.</p><p><a
+  href="{{ browse_url }}">&larr; Back to directory</a></p>{% else %} ...
+  {% endif %}`.
+
+  Remove `marked_set` (`__init__.py:535`), the two `'marked': ...` fields
+  (lines 559, 584) and `deletion_count` (line 585) from the view; add
+  `'can_manage_blacklist': _can_manage_blacklist(request)` to the context
+  instead (the same context key and rationale as 3e — a non-staff or
+  anonymous visitor should not see a control that only 403s). In the
+  template, wrap both Mark/Unmark buttons (lines 76-78, 88-90 — focal and
+  closest) in `{% if can_manage_blacklist %}...{% endif %}` and replace them
+  with the ID-bearing Hide buttons above, carrying
+  `data-path`/`data-thumb`/`data-name` the same way as 3e; add
+  `id="closest-panel"` to the optional closest panel and wrap the shared
+  modal include (3g) in the same condition.
+  Delete `#del-bar` (lines 114-123) and its CSS (lines 37-50), delete
+  `.mark-btn` CSS (lines 18-24) and its click handler (`MARK_URL`, lines
+  131, 135-155). `browse.html`, `compare.html`, and `semantic.html` need no
+  change: none of them ever offered Mark (confirmed by `grep -rn
+  "mark\|deletion" lib/imhandler/djview/templates/image_handler/{compare,browse,semantic}.html`
+  returning nothing), and their data is already blocked-filtered by Step 2,
+  so there is no authorization-gated control on those pages either.
+
+- **3g — shared modal, Hidden images template, nav.** New
+  `templates/image_handler/_hide_modal.html`: one hidden overlay `<div>`
+  per page (not one per row — `cluster_detail` can have many rows), wrapping
+  a `<form id="hide-modal-form">` containing `{% csrf_token %}` so the modal
+  never depends on another form surviving on the page to supply a CSRF
+  field, a thumbnail `<img>` and path text populated at open-time, and an
+  inline error area (`hidden` by default):
+  ```html
+  <div id="hide-modal" class="hm-overlay" hidden>
+    <form id="hide-modal-form" class="hm-box">
+      {% csrf_token %}
+      <img id="hm-thumb" src="" alt="">
+      <div id="hm-path"></div>
+      <p>The archive file remains on disk; imhandler will stop displaying and processing it.</p>
+      <div id="hm-error" class="hm-error" hidden></div>
+      <div class="hm-actions">
+        <button type="button" id="hm-cancel">Cancel</button>
+        <button type="submit" id="hm-confirm">Hide</button>
+      </div>
+    </form>
+  </div>
+  ```
+  **The whole script below is wrapped in an IIFE**, `(function() { ... })();`
+  — not for style, but because two real things go wrong without it. First,
+  a top-level `function close() { ... }` (used below) is also the name of
+  the built-in `window.close()`; a top-level function *declaration* in a
+  `<script>` tag becomes a property of `window`, so an unwrapped version
+  would silently overwrite the browser's own tab-closing function for the
+  rest of the page. Second, `cluster_detail.html` and `similar.html` each
+  already carry their own inline `<script>` block (the lightbox code, 3e's
+  addition above) — top-level `let`/`const`/`class` bindings across
+  multiple `<script>` tags on one page share a single global lexical
+  environment, so a same-named `const` in two of them is a `SyntaxError`
+  ("already declared"), not a harmless shadow the way `var` would be. An
+  IIFE gives every name below (`overlay`, `form`, `close`, ...) its own
+  function scope, immune to both problems regardless of what any other
+  script on the page happens to declare.
+
+  **CSRF and error handling need a fully specified flow, not just "post the
+  path and CSRF token" — two things go wrong with the naive version.**
+  First, `fetch` does not automatically include a form's fields; a bare
+  `fetch(url, {method: 'POST', body: JSON.stringify({path})})` would never
+  send the `{% csrf_token %}` field at all, so Django's `CsrfViewMiddleware`
+  would 403 every submission regardless of the token rendered in the DOM.
+  Second, a CSRF failure — or any non-2xx response that isn't `hide_image`
+  itself — comes back as Django's own HTML `CSRF_FAILURE_VIEW` page, not
+  JSON; a `response.json()` call on that response rejects with a
+  `SyntaxError`, and if that rejection isn't caught, the `catch` for the
+  *fetch* never runs, the button-disable from `setBusy(true)` is never
+  undone, and the dialog is left disabled with no inline error shown — the
+  "error path" section 2.4 asks for, and 1.3's "controls are disabled in
+  flight" would be permanently true instead of temporarily true. Fix both
+  with an explicit `async`/`try`/`catch`/`finally` handler, submitting the
+  form's own fields (which already include `csrfmiddlewaretoken`) via
+  `FormData` rather than hand-building a JSON body:
+  ```js
+  (function() {
+  const HIDE_URL = "{% url 'image_handler:hide_image' %}";
+  const overlay = document.getElementById('hide-modal');
+  const form = document.getElementById('hide-modal-form');
+  const thumbEl = document.getElementById('hm-thumb');
+  const pathEl = document.getElementById('hm-path');
+  const errorEl = document.getElementById('hm-error');
+  const cancelBtn = document.getElementById('hm-cancel');
+  const confirmBtn = document.getElementById('hm-confirm');
+  let currentPath = null, currentOnSuccess = null;
+
+  function setBusy(busy) { cancelBtn.disabled = busy; confirmBtn.disabled = busy; }
+  function showError(msg) { errorEl.textContent = msg; errorEl.hidden = false; }
+  function close() { overlay.hidden = true; errorEl.hidden = true; currentPath = null; currentOnSuccess = null; }
+
+  window.imhandlerHideModal = {
+    open({path, thumbUrl, name, onSuccess}) {
+      currentPath = path; currentOnSuccess = onSuccess;
+      thumbEl.src = thumbUrl; thumbEl.alt = name; pathEl.textContent = path;
+      errorEl.hidden = true; overlay.hidden = false;
+    },
+  };
+  cancelBtn.addEventListener('click', close);
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!currentPath) return;
+    setBusy(true);
+    errorEl.hidden = true;
+    try {
+      const body = new FormData(form);  // carries csrfmiddlewaretoken from {% csrf_token %}
+      body.set('path', currentPath);
+      const response = await fetch(HIDE_URL, {method: 'POST', body});
+      let data;
+      try {
+        data = await response.json();
+      } catch (parseErr) {
+        // Django's CSRF-failure page (and any other non-JSON error page,
+        // e.g. a 500 from an app server in front of Django) lands here.
+        throw new Error(
+          response.status === 403
+            ? 'Request rejected (missing or expired CSRF token). Reload the page and try again.'
+            : `Unexpected server response (HTTP ${response.status}).`
+        );
+      }
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `Request failed (HTTP ${response.status}).`);
+      }
+      const onSuccess = currentOnSuccess;
+      close();
+      if (onSuccess) onSuccess();
+    } catch (err) {
+      showError(err.message || 'Network error -- please try again.');
+    } finally {
+      setBusy(false);
+    }
+  });
+  })();
+  ```
+  `finally` is what guarantees Cancel/Hide are usable again after *any*
+  outcome — a JSON error body, a non-JSON error page, or `fetch` itself
+  rejecting (offline, DNS failure, aborted request) — rather than only after
+  the one "clean JSON error" path the naive version handles. `FormData`
+  needs no `Content-Type` header (the browser sets the correct
+  `multipart/form-data` boundary itself), and `request.POST.get('path')` on
+  the Django side reads a `FormData`-submitted field exactly like a native
+  form post, so `hide_image`'s implementation in 3c needs no change to
+  accept this. Included once near the end of `cluster_detail.html` and
+  `similar.html`, each inside the `{% if can_manage_blacklist %}` guard from
+  3e/3f.
+
+  New `templates/image_handler/hidden_images.html`: a table of `path` /
+  `exists` (rendered as e.g. "missing" when `False`, section 1.3: "including
+  missing files") / a per-row `<form method="post" action="{% url
+  'image_handler:restore_image' %}">` with `{% csrf_token %}`, a hidden
+  `path` input, and a plain "Show again" submit button — no modal, no
+  confirmation, and no thumbnail (section 2.4: "Do not show thumbnails
+  there because media endpoints deliberately block them" — an `<img
+  src="{{ thumb_url }}">` here would just render as a broken image, since
+  `thumb` 404s every blocked path unconditionally per 3d). A full
+  POST-redirect-GET back to `hidden/` is sufficient; section 1.3's
+  "without a full reload" requirement is scoped to the Hide action on
+  `cluster_detail`/`similar`, not to Show again.
+
+  `index.html` gains a conditional nav entry, following the existing
+  `{% if semantic_url %}`/`{% if specs_url %}` pattern (`index.html:6,9`)
+  rather than baking a new item into the `ImageHandlerViewSet.__init__`
+  nav list, which is built once at process start and has no access to
+  per-request authorization:
+  ```python
+  # index(), alongside the existing semantic_url lookup
+  hidden_url = _url('hidden_images') if _can_manage_blacklist(request) else None
+  ```
+  ```html
+  {% if hidden_url %}<li><a href="{{ hidden_url }}">Hidden images</a></li>{% endif %}
+  ```
+
+- **3h — removing the old code.** Once 3c-3g land, delete: `mark_toggle`,
+  `deletion_list_download`, `deletion_list_clear` (`__init__.py:364-398`);
+  the three routes at `urls.py:17-19` and aliases at `views.py:23-25`; every
+  remaining `deletion_list`/`marked_set` reference (already covered above,
+  listed here for the final `rg` sweep); the `.mark-btn`/`#del-bar` CSS in
+  both templates. Confirm nothing else in the repo still references
+  `mark_toggle`/`deletion_list_download`/`deletion_list_clear` before
+  deleting (`rg -n "mark_toggle|deletion_list"` — Step 4 runs the fuller
+  version of this search across specs too, but Step 3's own diff should
+  already be clean going in).
+
+**Tests.** Added to `tests/test_djview.py`, following its existing
+per-concern-class structure and its established fixture shape (temp
+`appconfig.image_roots`/`cache_dir`, `RequestFactory`, `_with_session` for
+session-touching views). `test_djview.py:67-82` maintains its own local
+mirror of `urls.py`'s route list (used by the URL-name `{% url %}` template
+tags this step's templates now rely on, and by the CSRF test below, which
+must resolve real routes rather than calling view functions directly) — it
+gains `hide/`/`hidden/`/`restore/` and drops `mark/`/`deletion-list/`/
+`deletion-list/clear/` in lockstep with `urls.py`.
+
+- **Authorization:** `_default_blacklist_authorizer` denies an anonymous
+  request and a non-staff authenticated one, allows an `is_staff=True` one
+  (a `SimpleNamespace`/`mock.Mock` standing in for `request.user` is enough
+  — no real `django.contrib.auth` user model round-trip needed); an
+  `IMHANDLER_BLACKLIST_AUTHORIZER` set via `mock.patch.object(settings,
+  'IMHANDLER_BLACKLIST_AUTHORIZER', ...)` overrides the default and is
+  consulted instead.
+- **`hide_image`:** authorized POST adds the path and returns
+  `{'ok': True}`; unauthorized returns 403 and leaves the blacklist
+  unchanged; GET returns 405; missing `path` returns 400; a path outside
+  every configured root returns 400 with the blacklist unchanged; hiding
+  the same path twice both return `{'ok': True}` (idempotent); a
+  hand-written corrupt store returns 500 rather than a stack trace.
+- **`restore_image`:** authorized POST removes a previously hidden path and
+  redirects (`302`) to `hidden/`, **not** a JSON body — this is the direct
+  regression test for the plain-`<form>`-vs-`JsonResponse` bug this revision
+  fixes, so assert `response['Content-Type']` is not `application/json` (or
+  simply that `response.status_code == 302` and there is no parseable JSON
+  body) in addition to checking the blacklist changed; restoring an absent
+  path still redirects with nothing changed (idempotent, no error); restoring
+  an entry whose root is no longer configured succeeds (the concrete
+  regression test for 3a's fix — `add()` it while the root is configured,
+  remove the root from `appconfig.image_roots`, confirm `remove()` would
+  `ValueError` here but `restore_image` still redirects successfully and the
+  entry is gone from `load()`); unauthorized returns a plain 403 (not a
+  redirect, so a non-staff user gets an unambiguous denial rather than being
+  bounced back to a page they also can't use); GET returns 405; a
+  hand-written corrupt store returns a plain-text 500 (via the
+  `PermissionError`-simulating case from 3a's fix, not just a hand-corrupted
+  JSON file) rather than an unhandled exception.
+- **`hidden_images`:** lists a mix of an existing and a missing-from-disk
+  path with correct `exists` values; unauthorized returns 403 via
+  `error.html`; a corrupt store returns 500 via `error.html` (not a bare
+  Django 500); an unconfigured `cache_dir` renders the same 500 path via
+  the caught `EnvironmentError` rather than an unhandled exception.
+- **`image`/`thumb` enforcement:** a hidden path 404s from `image()` with
+  `Cache-Control: no-store` (mirrors the existing `thumb` coverage at
+  `test_djview.py:285-303`); the same revalidation-ordering test as that
+  existing one, but against `image()`: load, hide, re-request with the
+  stale `If-Modified-Since` from the first response, assert 404 not 304; a
+  store made unreadable via `PermissionError` (not just structurally
+  malformed JSON — the 3a regression case) makes both `image()` and
+  `thumb()` 404 (fail closed) rather than 500.
+- **`similar`:** a blocked focal path renders `hidden_focal` truthy and the
+  "hidden" copy in the response body, not the "no embedding" message; an
+  unblocked focal path with a blocked closest neighbor never shows that
+  neighbor (already covered at the library level by Step 2's embedder
+  tests — this is only a thin page-level smoke check that the view doesn't
+  reintroduce it via a stale `blocked` snapshot); the Hide button and the
+  shared modal include are both absent from the rendered HTML for a
+  non-staff/anonymous request (`can_manage_blacklist=False`), and both
+  present for a staff request.
+- **`cluster_detail`:** the rendered page contains a `hide/` form action and
+  a `data-path` per member for an authorized request, and contains neither
+  `mark/` nor `deletion-list/` anywhere in its HTML (a `rg`-style substring
+  assertion, the template-level companion to the repo-wide sweep in Step 4);
+  for an unauthorized request, the rendered page contains no `hide-btn`
+  element and no `hide/` form action at all, only the read-only table.
+- **Cluster collapse on partial hide, no live click involved (the direct
+  fix for the gap this revision found):** build a two-member cluster where
+  both files exist on disk, `blacklist.add()` one member directly (standing
+  in for "hidden from another tab, another user, or the CLI" — no `hide/`
+  POST in this test), then `GET` `cluster_detail` and assert a `302` to
+  `compare/` with the `Clusters`/`ClusterMembership` rows for the *other*,
+  still-visible member left completely alone (only Hide/`purge` remove rows;
+  a `GET` never does). A companion test requests a `cluster_id` that was
+  never created at all and asserts `Http404`, not a `302` — proving the new
+  `SELECT 1 FROM Clusters` check actually distinguishes "no such cluster"
+  from "cluster collapsed by hiding," per `get_cluster_members`'s own
+  docstring warning, rather than conflating the two the way the raw
+  `len(rows)` check alone would. **A third variant is the actual regression
+  test for the second check** (the upfront `len(rows) < 2` alone does not
+  catch this): a three-member cluster with A hidden, B missing from disk,
+  and C present and visible. `rows` is `[B, C]` (length 2, upfront check
+  does not fire) and `cleanup_missing_members` returns `remaining == 2`
+  (`3` real members minus `1` missing — hiding doesn't reduce this count by
+  design — so the `remaining <= 1` branch does not fire either); assert the
+  view still redirects (`302` to `compare/`) via the second,
+  `visible_rows`-based check, that `B`'s `Images`/`ClusterMembership` rows
+  were deleted by `cleanup_missing_members` as always, and that `A`'s and
+  `C`'s rows are both left alone (the cluster is not collapsed — only
+  navigation changed, since `remaining == 2` never authorized a `DELETE`).
+  A fourth, contrasting variant keeps the existing `remaining <= 1`
+  collapse-and-delete path covered on its own terms: three members, none
+  hidden, two missing from disk — `remaining == 1` — and asserts the
+  `Clusters`/`ClusterMembership` rows are actually deleted, unlike the third
+  variant's redirect-without-deleting.
+- **Existing test update:** `test_hidden_but_present_member_does_not_delete_cluster`
+  (`test_djview.py:344-364`) is updated in place to assert `302`/`compare/`
+  instead of `200`, while its existing DB assertions (`Clusters` row present,
+  both `ClusterMembership` rows present) are kept exactly as they are — this
+  is the same scenario as the bullet above, already present in the suite
+  before this step, just asserting the wrong status code for what section
+  1.3 actually requires.
+- **Removed routes:** requesting `mark/`, `deletion-list/`, or
+  `deletion-list/clear/` against the URLconf returns `Resolver404`/404, not
+  a working (if unreachable-from-the-UI) endpoint left wired up by mistake.
+- **CSRF enforcement, end-to-end (the direct regression test for 3g's fix)
+  — a new `ImhandlerDjviewHideCsrfTests` class.** Every other test in this
+  file calls view functions directly through `RequestFactory`
+  (`request = self.factory.post(...); _vs.hide_image(request)`), which never
+  passes through Django's middleware chain at all — `CsrfViewMiddleware`
+  never runs, so none of those tests could ever have caught a modal that
+  forgets to send its token, which is exactly the bug this revision fixes.
+  This class instead goes through the real URLconf and a real
+  `CsrfViewMiddleware`, using `django.test.Client(enforce_csrf_checks=True)`
+  (the default test `Client` disables CSRF checks entirely, which would
+  make this test pass regardless of whether the fix was applied):
+  ```python
+  @override_settings(
+      MIDDLEWARE=['django.middleware.csrf.CsrfViewMiddleware'],
+      IMHANDLER_BLACKLIST_AUTHORIZER=lambda request: True,  # authorization is 3b/3e's concern, not this test's
+  )
+  class ImhandlerDjviewHideCsrfTests(unittest.TestCase):
+      def setUp(self):
+          ...  # same temp image_roots/cache_dir fixture as the other classes
+          self.client = Client(enforce_csrf_checks=True)
+
+      def test_valid_token_hides_the_path(self):
+          # hidden_images.html's {% csrf_token %} lives inside each row's
+          # restore form (3g) -- with an empty blacklist there are zero
+          # rows, so GETting /hidden/ would never call get_token() and
+          # Django would never set the csrftoken cookie at all. Seed an
+          # unrelated entry first so the page actually has a row to render.
+          seed_path = self.root / 'seed.jpg'
+          Image.new('RGB', (5, 5)).save(seed_path, 'JPEG')
+          blacklist.add(seed_path)
+
+          self.client.get('/hidden/')
+          token = self.client.cookies['csrftoken'].value
+          response = self.client.post('/hide/', {
+              'path': str(self.image_path), 'csrfmiddlewaretoken': token,
+          })
+          self.assertEqual(response.status_code, 200)
+          self.assertTrue(blacklist.is_blocked(self.image_path))
+
+      def test_missing_token_is_rejected_with_a_non_json_response(self):
+          response = self.client.post('/hide/', {'path': str(self.image_path)})
+          self.assertEqual(response.status_code, 403)
+          self.assertFalse(blacklist.is_blocked(self.image_path))
+          # The assertion that matters for 3g: this is what the modal's
+          # fetch actually receives on a CSRF failure, and it is not JSON --
+          # confirming the try/catch around response.json() isn't guarding
+          # against a hypothetical, it's guarding against Django's real
+          # default CSRF_FAILURE_VIEW response.
+          self.assertNotIn('application/json', response.get('Content-Type', ''))
+  ```
+  `test_valid_token_hides_the_path` posts the token as `csrfmiddlewaretoken`
+  in the body, matching the field name Django's `{% csrf_token %}` actually
+  renders. **This proves the server accepts that field; it does not prove
+  the JavaScript ever sends it** — the test client submits the POST body
+  directly and never executes `_hide_modal.html`'s `<script>` at all, so a
+  future edit that rewrites the modal's `fetch` call to a hand-built JSON
+  body (silently dropping the form's fields) would leave this test passing
+  unchanged while the real UI started 403ing on every Hide click. That
+  regression needs a different kind of test — a static assertion on the
+  rendered template source, not on server behavior:
+  ```python
+  def test_hide_modal_submits_via_formdata(self):
+      request = self.factory.get(f'/cluster/{self._make_cluster([...])}/')
+      # ... _with_session, IMHANDLER_BLACKLIST_AUTHORIZER True as elsewhere ...
+      html = _vs.cluster_detail(request, cluster_id).content.decode('utf-8')
+      self.assertIn('new FormData(form)', html)
+  ```
+  This is a coupling-to-exact-source-text check, not a behavioral one — it
+  would need updating if the modal's JS were ever legitimately rewritten —
+  but it is the cheapest thing that actually breaks when the submission
+  mechanism regresses, which `test_valid_token_hides_the_path` does not.
+  The same style of check covers the lightbox-reindexing fix: `cluster_detail`'s
+  rendered HTML must contain `MEMBERS.splice(idx, 1)` (proving the `onSuccess`
+  handler still retires the hidden entry from the navigation array, not just
+  the table row) and must **not** contain a bare `btn.closest('tr').remove()`
+  with nothing else in the same handler (the exact shape of the bug this
+  revision fixes) — a regression that drops the `MEMBERS`/`data-idx` upkeep
+  while keeping the row-removal line would otherwise pass every other test
+  in this file, since none of them open the lightbox or click a second
+  thumbnail after a hide.
+  **What no test in this suite can cover, static or otherwise:** the
+  modal's actual rendered error text after a 403 (`showError(...)`'s DOM
+  update), and whether the lightbox actually opens the correct image after
+  a hide reindexes the thumbnails, both require executing the JS in a
+  browser-like environment; this repo has no such harness (per `CLAUDE.md`:
+  "plain browser JavaScript," no `package.json`/Jest/Playwright anywhere in
+  the tree), so both are verified manually as part of Step 4's existing
+  manual-verification pass — specifically, hide the *first* of three
+  contact-sheet rows, then click each remaining thumbnail and confirm the
+  lightbox opens the image actually clicked, not its neighbor.
+  The CSRF test class above proves the *server* half of the bug precisely —
+  CSRF failures are real, frequent (any expired session), and not JSON —
+  which is what makes the client-side `try`/`catch` in 3g something other
+  than defensive boilerplate; it does not, by itself, prove the client
+  actually exercises that path correctly.
+
+**Verification:**
+```sh
+python3 -m py_compile lib/imhandler/*.py lib/imhandler/cli/*.py lib/imhandler/djview/*.py bin/imh
+python3 -m unittest tests.test_imhandler_blacklist tests.test_djview -v
+python3 -m unittest discover -s tests -t .
+cd llime && ./manage.py check && ./manage.py test
+```
+
 ### Step 4 — Specifications and verification
 
 Apply section 2.6 and search for stale workflow language:
