@@ -346,9 +346,9 @@ own transport. Eligibility follows the same required-vs-optional split
 `edit_images_availability()` uses: every required role must be usable,
 or — with no required roles — at least one optional role must be.
 
-**Warning consent, in two layers.** Grove now collects
-`accept_data_handling_warnings` consent (`upgrades/
-data-handling-warning-consent.md`), but the two layers must not be
+**Warning consent, in two layers.** Grove collects
+`accept_data_handling_warnings` consent for multi-image edit (see
+"Consent UI" below), but the two layers must not be
 confused: `_operation_state()`'s schema-level aggregate below is an
 *eligibility* fact (can this model be selected at all, and could it ever
 need consent), not the actual per-request gate.
@@ -429,6 +429,27 @@ also gets this indirectly from required-role completeness, but an
 ordered schema has no roles to catch it any other way); a role is
 assigned to more than one image; or a required role has no image
 assigned.
+
+**Consent UI.** A persistent `#edit-consent-row` (message + checkbox) is
+the last row inside `#edit-opts`, distinct from the transient
+`#model-info-notices` area above — it is shown only while the current
+model+assignment actually needs consent, displaying the backend's warning
+text verbatim (never Grove-paraphrased). `refreshEditWarningState()`
+computes this from current global state (never a stale argument) and is
+called from every place that can change it: `_applyEditMetadata()` (initial
+load, provider switch), the `edit-model-sel` change handler, the end of
+`renderEditImagesList()` (image add/remove/move/clear), the per-thumbnail
+role `<select>`, and the checkbox itself. The checkbox resets to unchecked
+whenever the reset key — `(provider, api, model id, messages)` — changes;
+provider is part of the key because model ids are only unique within a
+provider/API, so two providers reusing the same id and warning text must
+not let consent carry over between them. `handleEditSubmit()` always sends
+`accept_data_handling_warnings: !!checkbox.checked` and defensively refuses
+to submit if the row is visible and unchecked (mirroring this function's
+other pre-submit re-checks), so Grove cannot offer a way to submit while
+unchecked. `_do_edit_image()` parses `accept_data_handling_warnings`
+strictly server-side — only a literal JSON `true` counts; any other
+non-boolean value 400s explicitly rather than being coerced.
 
 **Testing.** `tests/js/` is a small Node project (`package.json`/
 `package-lock.json` committed, `node_modules/` gitignored) whose

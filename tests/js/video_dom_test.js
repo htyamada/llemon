@@ -1,6 +1,7 @@
 // jsdom-driven runtime checks for llemon_video/video.html's Segmind
 // start-image picker + data-handling-warning consent UI
-// (upgrades/segmind-image-to-video.md §1.2). Invoked as
+// (see specs/mediagen-video-user-interface-spec.md, "Segmind image-to-video
+// integration"). Invoked as
 // `node video_dom_test.js <path-to-rendered-html>` by
 // ../test_llemon_video_dom.py, which renders the page against a fixture
 // set of Segmind models covering every scenario this file exercises (see

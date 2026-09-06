@@ -59,8 +59,9 @@ logger = logging.getLogger(__name__)
 _MEDIA_EXTS = VIDEO_EXTS | IMAGE_EXTS
 
 # Grove-only, hardcoded notes about known provider quirks that aren't part of
-# hty7's model_presentation() payload (see upgrades/segmind-image-to-video.md
-# §1.3). Keyed by (provider, model id); omit the 'known_caveat' capability
+# hty7's model_presentation() payload (see mediagen-video-user-interface-spec.md,
+# "Known caveat: aspect ratio not honored"). Keyed by (provider, model id); omit
+# the 'known_caveat' capability
 # key entirely when a model has no entry here.
 _KNOWN_MODEL_CAVEATS: dict[tuple[str, str], str] = {
     ('segmind', 'wan-2.2-i2v-fast'): (

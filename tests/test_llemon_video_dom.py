@@ -1,6 +1,7 @@
 """Runtime (real-DOM) regression test for llemon_video/video.html's
 Segmind start-image picker + data-handling-warning consent UI
-(upgrades/segmind-image-to-video.md §1.2).
+(see specs/mediagen-video-user-interface-spec.md, "Segmind image-to-video
+integration").
 
 Mirrors tests/test_llemon_image_edit_dom.py: node --check only validates
 JS syntax and tests/test_image_creator_render.py only string-matches the

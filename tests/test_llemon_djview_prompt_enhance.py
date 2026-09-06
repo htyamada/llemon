@@ -539,7 +539,8 @@ def _segmind_presentation(**overrides):
 
 class SegmindVideoStartImageConsentTests(_DjviewTestCase):
     """Covers videogen.py's Segmind start-image accept_data_handling_warnings
-    gate (upgrades/segmind-image-to-video.md §1.2): a picker-sourced (or any
+    gate (see specs/mediagen-video-user-interface-spec.md, "Segmind
+    image-to-video integration"): a picker-sourced (or any
     other) data: image_url for wan-2.2-i2v-fast's provider_upload transport
     may reach the backend only with consent; a public https:// URL never
     resolves to data: and so never needs it.

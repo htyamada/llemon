@@ -132,107 +132,99 @@ LLemon's normalized presentation to expose a start-image control for this
 model and forwards it as `image_url`; Segmind does not support an end image,
 so no end-image control is offered.
 
-**As currently implemented in Grove (unchanged by the LLemon update below):**
-the start-image control is a plain URL text field (`segmind_start_image_url`
-in `video.html`, gated on `currentProvider === 'segmind'` and the model's
-`allows_start_image`), not the Gallery/Source-Dirs image picker used for
-Venice and OpenRouter. The submitted value is still routed through the same
-private-media conversion helper as every other provider
-(`_data_reference_for_api`) before reaching the backend: a stray private
-Grove media URL pasted into the field converts to a `data:` URL, a public
-URL passes through unchanged.
+**As implemented in Grove (2026-09-04).** Segmind's start-image control is
+the same `#start-image-row` Gallery/Source-Dirs picker used for Venice and
+OpenRouter — picker-only, with no manual-URL fallback (`video.html`'s old
+`#segmind-start-image-row`/`#segmind_start_image_url` field, its
+`showSegmindStartImage` visibility wiring, its `resetForm()` clear, and its
+`applyUrlPrefill()` special case are all gone; that provider now shares the
+same non-Segmind code path as everyone else at each of those sites). The
+submitted value is still routed through the same private-media conversion
+helper as every other provider (`_data_reference_for_api`) before reaching
+the backend: a stray private Grove media URL selected via the picker
+converts to a `data:` URL, a public URL passes through unchanged.
 
-**LLemon's own constraint has since changed (2026-09-04), not yet reflected
-in Grove.** LLemon originally accepted only a well-formed public `https://`
-URL for this model and rejected `data:` URLs outright, which is why the
-control above was built as a manual field rather than a picker — the picker
-converts a selected file to a `data:` URL server-side, which this model used
-to reject unconditionally. LLemon now also accepts a `data:` `image_url` for
-`wan-2.2-i2v-fast` specifically, through a live-validated `provider_upload`
-transport (upload to Segmind, submit the returned hosted reference), gated
-by `model_presentation()`'s `available_backend_transports` containing
-`'provider_upload'` and by a new `accept_data_handling_warnings` parameter
-on `generate()`, which Grove never sets — so a converted `data:` URL still
-gets rejected in practice today, just for a different reason
-(`warning_not_accepted` instead of the old blanket data-URL rejection).
-Grove has not yet been updated to use this: doing so needs a
-data-handling-warning consent UI
-element Grove does not currently have for *any* media type (not video-only —
-see `~/prj/grove/upgrades/segmind-image-to-video.md`, "1.1", for exactly
-what's missing and where), plus the mechanical picker swap itself.
-`~/prj/grove/upgrades/segmind-image-to-video.md` tracks both pieces of
-remaining work and the concrete `video.html`/`videogen.py` locations they
-touch; this section stays the authoritative *contract* description, that
-file is the authoritative *task list*.
+LLemon originally accepted only a well-formed public `https://` URL for this
+model and rejected `data:` URLs outright, which is why the control used to
+be a manual field rather than a picker. LLemon now also accepts a `data:`
+`image_url` for `wan-2.2-i2v-fast` specifically, through a live-validated
+`provider_upload` transport (upload to Segmind, submit the returned hosted
+reference), gated by `model_presentation()`'s `available_backend_transports`
+containing `'provider_upload'` and by an `accept_data_handling_warnings`
+parameter on `generate()`. Grove now sets that flag, per request, once the
+conditions in "Implementation" below hold — this is the same
+`accept_data_handling_warnings` consent Grove collects generically for
+image editing (`specs/mediagen-image-user-interface-impl.md`, "Warning
+consent, in two layers"), applied here to video's single-scope case.
 
-#### Design: the hty7-dependent contract (2026-09-04)
+#### Implementation: the hty7-dependent contract (2026-09-04)
 
-Scoped deliberately: this designs only the parts of the picker-swap work
-that depend on LLemon's API surface (see
+This covers only the parts of the picker-swap work that depend on LLemon's
+API surface (see
 `~/src/hty7/python3/prj/llemon/specs/mediagen-video-segmind-spec.md`,
-"Task 9 Step 3"). The picker-swap
-mechanics themselves (`video.html`'s `#image-picker`/`pickerTarget`
-plumbing) and the still-untracked Grove-wide consent-checkbox UI (the
-upgrade file's "1.1") are separate, hty7-independent design work not
-covered here.
+"Task 9 Step 3"). The generic picker-swap mechanics themselves
+(`video.html`'s `#image-picker`/`pickerTarget` plumbing) are the same ones
+Venice and OpenRouter already used; nothing video-specific was needed there.
 
-1. **Availability gate, fail closed.** Before offering picker-sourced
-   private images for a Segmind i2v model's start image, Grove's JS must
-   read `available_backend_transports` off that model's presentation record
-   and check it contains `'provider_upload'` — never hardcode
-   `wan-2.2-i2v-fast`. Re-evaluate this on every model-selection change
-   (mirrors the existing re-evaluation already done for
+1. **Availability gate, fail closed.** `segmindStartImagePickerState(modelId)`
+   (`video.html`) reads `available_backend_transports` off that model's
+   presentation record and checks it contains `'provider_upload'` — never
+   hardcodes `wan-2.2-i2v-fast`. It re-evaluates on every model-selection
+   change (mirroring the existing re-evaluation already done for
    `allows_start_image`), since availability is per-model and
    `UPLOAD_VERIFIED_I2V_MODELS` currently contains only one entry. The
-   picker may be enabled only on a positive, declared signal — a required
+   picker is enabled only on a positive, declared signal — a required
    transport present *and* listed as available; a model whose presentation
-   lacks this metadata entirely must be treated the same as one that
-   declares the transport unavailable, never as "must be fine." Per point 5
-   below, Grove no longer keeps a manual-URL field to fall back to: any of
-   these disabled cases must render the picker control itself in a visibly
-   disabled state with an explanation, never an enabled control that would
-   400 on every selection.
+   lacks this metadata entirely (not merely an empty dict) is treated the
+   same as one that declares the transport unavailable, never as "must be
+   fine." Since there is no manual-URL fallback (point 5), every disabled
+   case renders `#start-image-btn` itself `disabled`, with a note element
+   explaining why, rather than an enabled control that would 400 on every
+   selection.
 
-2. **The warning text is LLemon's, not Grove's, to author.** Whatever
-   consent-UI element gets built (upgrade file "1.1") must display
-   `transport_warnings['provider_upload']` verbatim — never a
-   Grove-paraphrased version. This is the same rule LLemon's
-   `~/src/hty7/python3/prj/llemon/specs/mediagen-image-spec.md`'s
-   "Data-handling warnings and caller acceptance" already states for
-   imagegen's own (also not yet built) consent UI — there is no
-   Grove-local equivalent of that contract page, only this section — so
-   there's no reason for video to diverge, and building the element
-   generically (per "1.1") means it wouldn't have to.
+2. **The warning text is LLemon's, not Grove's.** `#segmind-consent-row`
+   (placed immediately after `#start-image-row`, styled like image
+   editing's `#edit-consent-row`) displays `transport_warnings['provider_upload']`
+   verbatim — never a Grove-paraphrased version. This is the same rule
+   LLemon's `~/src/hty7/python3/prj/llemon/specs/mediagen-image-spec.md`'s
+   "Data-handling warnings and caller acceptance" states for imagegen's
+   consent UI; video's `#segmind-consent-row` and image editing's
+   `#edit-consent-row` are independent UI elements (different templates)
+   built to the same verbatim-text rule, not shared markup.
 
-3. **When Grove may set `accept_data_handling_warnings=True`.** Exactly
-   when all three hold: the request targets Segmind; the resolved
-   `image_url` — after `_data_reference_for_api()` — is a `data:` URL
-   (i.e., a private/picker-sourced image; a pasted public `https://` URL
-   never needs this, see point 5); and the consent checkbox for *this*
-   control, at *this* moment, is checked — not merely rendered. As with
-   imagegen's identical contract, the checkbox must reset to unchecked
-   whenever the resolved warning text or the selected model changes, so a
-   prior check on a different model can never silently carry over to this
-   one. Grove must never default this to `True` — see point 6 for why
-   Grove's own gating is a UX obligation, not the actual enforcement.
+3. **When Grove sets `accept_data_handling_warnings=True`.** Exactly when
+   all three hold: the request targets Segmind; the resolved `image_url` —
+   after `_data_reference_for_api()` — is a `data:` URL (i.e., a
+   private/picker-sourced image; a pasted public `https://` URL never needs
+   this, see point 5); and the consent checkbox is checked at submit time —
+   not merely rendered. `refreshSegmindConsent()` is hooked into the single
+   shared place `startImageUrl` actually changes — the end of
+   `updateStartImageDisplay()` (a no-op for every non-Segmind provider) —
+   plus the provider/model switch and the checkbox's own `change` listener,
+   so picking, clearing, and URL-prefilling the start image (`?image_url=`)
+   all keep the row in sync. The checkbox resets to unchecked whenever a
+   `(currentProvider, CREATOR_PRESENTATION.api, modelSel.value, warning)`
+   key changes, so a prior check for a different model or provider can
+   never silently carry over. The submit handler defensively refuses to
+   submit if the row is visible and unchecked, and always sends
+   `accept_data_handling_warnings: !!checkbox.checked` for Segmind.
 
 4. **No new server-side error handling is needed.** `videogen.py`'s
    existing `generate()` call site already forwards any `result['error']`
    dict generically (`err.get('message')`, HTTP 502) — this already covers
    every new error type this transport can produce, with no additional
-   code. Worth knowing what they mean, since they'll now start appearing
-   verbatim in Grove's UI for this one model:
-   - `warning_not_accepted` — should be unreachable if point 3's gating
-     works correctly; if it appears anyway, the checkbox wasn't actually
-     checked at submit time (a Grove bug, not a user input error).
+   code. Worth knowing what they mean, since they can appear verbatim in
+   Grove's UI for this one model:
+   - `warning_not_accepted` — should be unreachable given point 3's
+     gating; if it appears anyway, the checkbox wasn't actually checked at
+     submit time (a Grove bug, not a user input error).
    - `invalid_input` — the picked image failed the upload's own
      format/size preflight: only `png`/`jpg`/`webp` are accepted for
      upload (narrower than the Gallery's own accepted formats — a GIF
      will hit this specifically) and it must not exceed 64MB. Grove does
-     not currently filter the Gallery/Source-Dirs picker by format for
-     this control; whether it should, to avoid a foreseeable rejection for
-     an otherwise-valid Gallery pick, is an open UX question for whoever
-     implements "1.2."
+     not filter the Gallery/Source-Dirs picker by format for this control,
+     so an otherwise-valid Gallery pick in another format surfaces this
+     error rather than being pre-filtered.
    - `ambiguous_upload` / `authentication_error` (from the upload step,
      distinct from the same-named error a submit-phase failure can also
      produce) / `parse_error` (a malformed upload response) — Segmind-side
@@ -240,15 +232,16 @@ covered here.
      `generate()` failure Grove already shows today.
 
 5. **The manual public-URL field's fate was a Grove UX decision, not an
-   hty7 one — decided (2026-09-04): removed.** Nothing about the transport
-   required removing it (a genuinely public, already-hosted `https://` URL
-   would have worked unaffected by any of the above, since point 3's second
-   condition never triggers for it), but Grove chose to make Segmind's
-   start-image control match Venice's own — picker-only, no manual-URL
-   fallback — rather than carry two input paths with different consent
-   rules. See point 1 above for the consequence: since there is no
-   fallback, an unavailable-transport model must disable the picker control
-   itself rather than leave the user with no working input at all.
+   hty7 one — decided and implemented (2026-09-04): removed.** Nothing
+   about the transport required removing it (a genuinely public,
+   already-hosted `https://` URL would have worked unaffected by any of the
+   above, since point 3's second condition never triggers for it), but
+   Grove made Segmind's start-image control match Venice's own —
+   picker-only, no manual-URL fallback — rather than carry two input paths
+   with different consent rules. See point 1 for the consequence: since
+   there is no fallback, an unavailable-transport model disables the
+   picker control itself rather than leaving the user with no working
+   input at all.
 
 6. **Backend enforcement, for calibration.** `_generate_impl()` fails
    closed independent of anything Grove does: a `data:` `image_url` for a
@@ -259,8 +252,33 @@ covered here.
    only to make sure a human made an informed, deliberate choice — never
    to substitute for LLemon's own check — mirroring the same
    frontend/backend relationship LLemon's
-   `~/src/hty7/python3/prj/llemon/specs/mediagen-image-spec.md` already
-   documents for imagegen's identical, still-unbuilt consent UI.
+   `~/src/hty7/python3/prj/llemon/specs/mediagen-image-spec.md` documents
+   for imagegen's consent UI.
+
+#### Known caveat: aspect ratio not honored (2026-09-04)
+
+A live-validation run of `wan-2.2-i2v-fast` returned square (624×624)
+output instead of the requested 16:9 landscape shape, even though
+`_generate_impl()` always sends `aspect_ratio` explicitly on the wire. This
+looks like Segmind's model not reliably honoring `aspect_ratio` for
+image-to-video mode specifically — provider behavior, not an hty7 or Grove
+defect, and not chased down further.
+
+Grove surfaces this as a static, informational, Grove-only notice keyed off
+`(provider, model_id)` — not data sourced from hty7 (LLemon's
+`model_presentation()` has no "known caveat"/quirk field for any provider).
+`videogen.py`'s `_KNOWN_MODEL_CAVEATS` maps `('segmind', 'wan-2.2-i2v-fast')`
+to the warning text; `_model_options()` merges it into
+`capabilities['known_caveat']` (both the metadata-rich and plain-id-list
+branches), omitting the key entirely for every other model so their JSON
+payload is byte-for-byte unchanged. `video.html`'s `modelCapabilities(modelId)`
+reads it and `#model-caveat-notice` (next to `#model-description`, same
+warning color as the consent rows) renders it, refreshed from the same call
+site that already updates the description text on every model-change path
+(provider switch, model switch, `pageshow` restore, URL prefill) — no
+per-path special casing needed. This notice is purely informational and
+independent of the consent/picker machinery above: it shows as soon as the
+model is selected, before any start image is picked.
 
 For Venice models, the creator consumes the normalized `presentation` record
 from LLemon's public video facade. LLemon centralizes catalog-schema precedence
