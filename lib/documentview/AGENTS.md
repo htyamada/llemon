@@ -23,8 +23,8 @@ document that shaped it (`upgrades/books.md`) has been superseded by this
 file and the code, and was removed once the app was fully implemented.
 
 The active consumer is `../../llime` (mounted at `/documents/`, nav label
-"Library"). `../qat/knip` has no document collection and is not expected to
-mount this app; nothing here assumes it will.
+"Document View"). `../qat/knip` has no document collection and is not
+expected to mount this app; nothing here assumes it will.
 
 ## Configuration
 

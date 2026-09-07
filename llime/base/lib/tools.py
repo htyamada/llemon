@@ -5,7 +5,7 @@ nav = [
     {'name': 'Image Handler', 'url': reverse_lazy('image_handler:index')},
     {'name': 'To Do',         'url': reverse_lazy('to_do_list:index')},
     {'name': 'Media Viewer',  'url': reverse_lazy('mediaview:index')},
-    {'name': 'Library',       'url': reverse_lazy('documentview:index')},
+    {'name': 'Document View', 'url': reverse_lazy('documentview:index')},
 ]
 
 nav_rel = nav

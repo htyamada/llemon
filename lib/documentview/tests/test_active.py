@@ -453,7 +453,7 @@ class ActiveHttpTests(DocumentViewClientTestCase):
         # won't resolve to any logical document any more.
         r = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'rel_path': 'a/Book.epub'})
         self.assertEqual(r.status_code, 200)
-        self.assertIn(b'Back to the library', r.content)
+        self.assertIn(b'Back to Document View', r.content)
         self.assertIsNone(active.find_link_for_source('a/Book.epub'))
 
 

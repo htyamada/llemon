@@ -3,10 +3,10 @@
 {% block extra_head %}<link rel="stylesheet" href="{{ documentview_stylesheet_url }}">{% endblock %}
 
 {% block content %}
-<nav class="dv-breadcrumbs"><a href="{% url 'documentview:index' %}">Library</a></nav>
+<nav class="dv-breadcrumbs"><a href="{% url 'documentview:index' %}">Document View</a></nav>
 
 {% if active_error %}<div class="dv-error">{{ active_error }}</div>{% endif %}
 {% if active_notice %}<div class="dv-notice">{{ active_notice }}</div>{% endif %}
 
-<p><a href="{% url 'documentview:index' %}">Back to the library</a></p>
+<p><a href="{% url 'documentview:index' %}">Back to Document View</a></p>
 {% endblock %}
