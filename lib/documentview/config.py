@@ -1,10 +1,23 @@
 """Settings, defaults, and validation for the documentview app.
 
+`root`, `active_dir`, and `active_manifest` normally come from the repo's
+own `etc/documentview.conf` (loaded into the `appconfig` module by
+`apps.py`'s `ready()`, following the same convention as
+`etc/imhandler.conf`/`etc/llemon_djview.conf`). A host's
+`DOCUMENT_VIEWER_ROOT`/`DOCUMENT_VIEWER_ACTIVE_DIR`/
+`DOCUMENT_VIEWER_ACTIVE_MANIFEST` Django setting, when present *and
+non-empty*, wins over the conf file (see `_configured()`) -- this is what
+lets tests point each of these at a fresh temp directory via
+`override_settings` without touching the real conf. A setting explicitly
+set to `''` is treated as not set, rather than being resolved as
+`Path('')` -- the process's working directory; `root()`/`active_dir()`
+raise `ImproperlyConfigured` outright if nothing configures them.
+
 `AppConfig.ready()` calls `validate_shape()`, which only checks that each
-setting is present and of the right type (Path / callable / dict) using pure
-string/PurePath comparison -- no filesystem access. That way `manage.py
-check`, migrations, and unrelated management commands never fail just
-because a deployment mount happens to be absent.
+value is present and of the right type (str/Path / callable / dict) using
+pure string/PurePath comparison -- no filesystem access. That way
+`manage.py check`, migrations, and unrelated management commands never
+fail just because a deployment mount happens to be absent.
 
 The equivalent live check (that the configured roots exist, and that the
 cache dir / manifest / manifest lock / active dir all resolve outside
@@ -20,6 +33,8 @@ from pathlib import Path, PurePath
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
+
+from . import appconfig
 
 DEFAULT_CACHE_DIR = '~/var/documentview/cache'
 DEFAULT_ACTIVE_MANIFEST = '~/var/documentview/state/active_manifest.json'
@@ -53,12 +68,36 @@ def _default_authorize(request, action):
     return request.user.is_authenticated
 
 
+def _configured(setting_name: str, appconfig_value: str):
+    """The host Django setting wins when it's set to a truthy value;
+    otherwise the `etc/documentview.conf`-loaded value. A setting that's
+    merely *present but falsy* (`DOCUMENT_VIEWER_ROOT = ''`) is treated the
+    same as absent -- matching `validate_shape()` -- rather than being used
+    as-is, which would let `Path('')` (the process's working directory)
+    silently stand in for a real, configured root.
+    """
+    value = getattr(settings, setting_name, None)
+    return value if value else appconfig_value
+
+
 def root() -> Path:
-    return Path(settings.DOCUMENT_VIEWER_ROOT).expanduser().resolve()
+    value = _configured('DOCUMENT_VIEWER_ROOT', appconfig.root)
+    if not value:
+        raise ImproperlyConfigured(
+            'DOCUMENT_VIEWER_ROOT is not configured (set root in etc/documentview.conf, '
+            'or the DOCUMENT_VIEWER_ROOT setting)'
+        )
+    return Path(value).expanduser().resolve()
 
 
 def active_dir() -> Path:
-    return Path(settings.DOCUMENT_VIEWER_ACTIVE_DIR).expanduser().resolve()
+    value = _configured('DOCUMENT_VIEWER_ACTIVE_DIR', appconfig.active_dir)
+    if not value:
+        raise ImproperlyConfigured(
+            'DOCUMENT_VIEWER_ACTIVE_DIR is not configured (set active_dir in etc/documentview.conf, '
+            'or the DOCUMENT_VIEWER_ACTIVE_DIR setting)'
+        )
+    return Path(value).expanduser().resolve()
 
 
 def cache_dir() -> Path:
@@ -67,7 +106,7 @@ def cache_dir() -> Path:
 
 
 def active_manifest_path() -> Path:
-    value = getattr(settings, 'DOCUMENT_VIEWER_ACTIVE_MANIFEST', DEFAULT_ACTIVE_MANIFEST)
+    value = _configured('DOCUMENT_VIEWER_ACTIVE_MANIFEST', appconfig.active_manifest) or DEFAULT_ACTIVE_MANIFEST
     return Path(value).expanduser().resolve()
 
 
@@ -102,25 +141,34 @@ def limit(name: str):
 
 
 def validate_shape() -> None:
-    """Startup-safe validation: types and non-overlap only, no filesystem access."""
-    if not hasattr(settings, 'DOCUMENT_VIEWER_ROOT'):
+    """Startup-safe validation: types and non-overlap only, no filesystem access.
+
+    `root`/`active_dir` normally come from `etc/documentview.conf` (already
+    loaded into the `appconfig` module by the time `ready()` calls this),
+    with the DOCUMENT_VIEWER_ROOT/DOCUMENT_VIEWER_ACTIVE_DIR Django
+    settings, when set, taking precedence -- same lookup order as
+    `root()`/`active_dir()`.
+    """
+    root_value = _configured('DOCUMENT_VIEWER_ROOT', appconfig.root)
+    if not root_value:
         return  # app installed but not configured (e.g. a host with no collection)
+    if not isinstance(root_value, (str, PurePath)):
+        raise ImproperlyConfigured('DOCUMENT_VIEWER_ROOT must be a path')
 
-    root_value = settings.DOCUMENT_VIEWER_ROOT
-    if not isinstance(root_value, PurePath):
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ROOT must be a pathlib.Path')
-
-    if not hasattr(settings, 'DOCUMENT_VIEWER_ACTIVE_DIR'):
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR is required when DOCUMENT_VIEWER_ROOT is set')
-    active_value = settings.DOCUMENT_VIEWER_ACTIVE_DIR
-    if not isinstance(active_value, PurePath):
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR must be a pathlib.Path')
+    active_value = _configured('DOCUMENT_VIEWER_ACTIVE_DIR', appconfig.active_dir)
+    if not active_value:
+        raise ImproperlyConfigured(
+            'DOCUMENT_VIEWER_ACTIVE_DIR is required when DOCUMENT_VIEWER_ROOT is set '
+            '(set active_dir in etc/documentview.conf or the DOCUMENT_VIEWER_ACTIVE_DIR setting)'
+        )
+    if not isinstance(active_value, (str, PurePath)):
+        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR must be a path')
 
     cache_value = getattr(settings, 'DOCUMENT_VIEWER_CACHE_DIR', DEFAULT_CACHE_DIR)
     if not isinstance(cache_value, (str, PurePath)):
         raise ImproperlyConfigured('DOCUMENT_VIEWER_CACHE_DIR must be a path')
 
-    manifest_value = getattr(settings, 'DOCUMENT_VIEWER_ACTIVE_MANIFEST', DEFAULT_ACTIVE_MANIFEST)
+    manifest_value = _configured('DOCUMENT_VIEWER_ACTIVE_MANIFEST', appconfig.active_manifest) or DEFAULT_ACTIVE_MANIFEST
     if not isinstance(manifest_value, (str, PurePath)):
         raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_MANIFEST must be a path')
 

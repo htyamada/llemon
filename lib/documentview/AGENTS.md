@@ -13,7 +13,8 @@ reader shared by EPUB/CBZ code; `images.py` is the shared bounded-image
 decode helper; `epub.py` is shared EPUB container/OPF parsing;
 `pdfrender.py` wraps the `pdftoppm` subprocess; `subresources.py` signs
 archive-internal preview identifiers; `active.py` owns the active-reader
-manifest and locked symlink staging; `config.py` owns settings, defaults,
+manifest and locked symlink staging; `appconfig.py` loads the filesystem
+paths from `etc/documentview.conf`; `config.py` owns settings, defaults,
 and lazy filesystem validation; `views.py` / `urls.py` wire it all up.
 Templates live under `templates/documentview/`, static assets under
 `static/documentview/`, and tests under `tests/`. This file is the
@@ -27,23 +28,43 @@ mount this app; nothing here assumes it will.
 
 ## Configuration
 
-Required, no default (host must set both):
+`root`, `active_dir`, and `active_manifest` are filesystem paths and live
+in the repo's own `etc/documentview.conf` -- a visible, versioned TOML file
+following the same convention as `etc/imhandler.conf`/`etc/llemon_djview.conf`
+(sections keyed `[<variant>.documentview.core]`, parsed via the shared
+`hty7.config.AppConfig`). Edit that file directly to change where the
+collection root or the active-reader directory live; no code or Django
+settings edit is needed for the common case:
 
-```python
-DOCUMENT_VIEWER_ROOT = Path('/srv/cloud/store/books-and-text/')  # llime's value
-DOCUMENT_VIEWER_ACTIVE_DIR = Path('~/var/documentview/reader')
+```toml
+[hty7.documentview.core]
+root = "/srv/cloud/store/books-and-text/"      # required, no default
+active_dir = "~/var/documentview/reader"        # required, no default
+active_manifest = "~/var/documentview/state/active_manifest.json"  # optional
 ```
 
-`~` expands under the account running `manage.py` / the WSGI process,
-which may differ from the developer's own home directory -- both roots run
-through `Path(...).expanduser().resolve()`.
+`apps.py`'s `ready()` loads this file into the `appconfig` module via
+`appconfig.init_variant(getattr(settings, 'DOCUMENT_VIEWER_VARIANT', 'hty7'))`
+-- the host selects a variant/section the same way `IMHANDLER_VARIANT` and
+`MEDIAVIEW_LABEL` do for their own apps. `~` expands under the account
+running `manage.py` / the WSGI process, which may differ from the
+developer's own home directory -- both roots run through
+`Path(...).expanduser().resolve()`.
+
+A host's Django settings, when set, still take precedence over the conf
+file -- `DOCUMENT_VIEWER_ROOT`, `DOCUMENT_VIEWER_ACTIVE_DIR`, and
+`DOCUMENT_VIEWER_ACTIVE_MANIFEST` all follow "host setting wins; otherwise
+the conf-file value" (`config.root()`/`config.active_dir()`/
+`config.active_manifest_path()`). This is what lets tests point each one
+at a fresh temp directory via `override_settings` without touching the
+real conf file; a host project isn't expected to set these in
+`settings.py` under normal operation.
 
 Optional, with defaults:
 
 | Setting | Default |
 |---|---|
 | `DOCUMENT_VIEWER_CACHE_DIR` | `~/var/documentview/cache` |
-| `DOCUMENT_VIEWER_ACTIVE_MANIFEST` | `~/var/documentview/state/active_manifest.json` |
 | `DOCUMENT_VIEWER_AUTHORIZE` | `lambda request, action: request.user.is_authenticated` |
 | `DOCUMENT_VIEWER_STYLESHEET_URL` | Django static URL for `documentview/documentview.css` |
 | `DOCUMENT_VIEWER_COVER_SIZES` | `{"thumb": (150, 220), "detail": (300, 440)}` |
@@ -109,6 +130,9 @@ install these itself:
   generic-cover / "no preview available" fallback, and download still
   works. `mutool`/PyMuPDF/`pypdf`/`pdf2image`/`ebooklib` are deliberately
   not used; `pdftoppm` is the one PDF rendering code path.
+- **`hty7.config`** -- `appconfig.py`'s `etc/documentview.conf` loader, the
+  same shared TOML/variant-selection helper `imhandler.appconfig` and
+  `llemon_djview` use for `etc/imhandler.conf`/`etc/llemon_djview.conf`.
 
 ## Supported Formats & Logical-Document Grouping
 

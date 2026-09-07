@@ -74,3 +74,11 @@ it accesses. There are no separate or untrusted users. Treat validation,
 bounded parsing, path handling, and similar safeguards as reliability features
 against mistakes and malformed personal data, not as security boundaries or a
 multi-user threat model.
+
+Some archived content (e.g. downloaded EPUBs/PDFs/CBZs) is produced by third
+parties rather than the operator, so it should be treated as not fully
+trusted -- but the bar is "possibly malformed or subtly broken," not
+"possibly weaponized." Keep bounded parsing, size/pixel caps, and path
+containment for that reason, proportionate and simple; do not add further
+hardening whose only justification is resisting a deliberate, actively
+hostile attacker.

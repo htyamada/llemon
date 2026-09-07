@@ -1,4 +1,5 @@
 from django.apps import AppConfig
+from django.conf import settings
 
 
 class DocumentViewConfig(AppConfig):
@@ -7,5 +8,6 @@ class DocumentViewConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
 
     def ready(self):
-        from . import config
+        from . import appconfig, config
+        appconfig.init_variant(getattr(settings, 'DOCUMENT_VIEWER_VARIANT', 'hty7'))
         config.validate_shape()

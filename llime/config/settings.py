@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, os.path.expanduser('~/prj/grove/lib'))
 MEDIAVIEW_LABEL = 'hty7'
 IMHANDLER_VARIANT = 'hty7'
+DOCUMENT_VIEWER_VARIANT = 'hty7'
 
 import llemon_djview as _llemon_djview
 globals().update(_llemon_djview.django_settings('hty7'))
@@ -142,10 +143,10 @@ USE_TZ = True
 
 STATIC_URL = '/zorf/llime/static/'
 
-# documentview -- see ../../lib/documentview/README.md
-DOCUMENT_VIEWER_ROOT = Path('/srv/cloud/store/books-and-text/')
-DOCUMENT_VIEWER_ACTIVE_DIR = Path('~/var/documentview/reader')
-DOCUMENT_VIEWER_ACTIVE_MANIFEST = Path('~/var/documentview/state/active_manifest.json')
+# documentview -- see ../../lib/documentview/CLAUDE.md.
+# DOCUMENT_VIEWER_ROOT / DOCUMENT_VIEWER_ACTIVE_DIR / DOCUMENT_VIEWER_ACTIVE_MANIFEST
+# are configured in ../../etc/documentview.conf (variant selected by
+# DOCUMENT_VIEWER_VARIANT above), not here -- see that file to change them.
 DOCUMENT_VIEWER_STYLESHEET_URL = '/zorf/llime/static/base/css/documentview.css'
 
 
