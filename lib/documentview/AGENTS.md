@@ -288,6 +288,12 @@ reported clearly rather than silently repaired.
 
 ## Security Model
 
+This is an operational-reliability model, not a multi-user security boundary:
+Grove has one person who configures, develops, operates, and creates the
+archive accessed by this app. The measures below prevent accidents and bad
+personal data from causing surprising behavior; they do not defend against
+separate or untrusted users.
+
 - **Path resolution** (`paths.py`): `resolve_directory()`/`resolve_document()`
   reject absolute input, `..`, and NUL bytes, and walk every directory
   component `O_NOFOLLOW` relative to the previous component's pinned

@@ -65,3 +65,12 @@ Do not commit secrets or machine-local config. Runtime settings come from files
 under `~/etc/`, while generated logs and caches live under `~/var/`. Shared apps
 may be imported by host projects through `sys.path`, so keep public module names
 stable and document path changes in both host settings and `lib/*` docs.
+
+### Operational Trust Model
+
+Grove is a single-person system: the person configuring, developing, and
+operating an application is also the person creating the archives and content
+it accesses. There are no separate or untrusted users. Treat validation,
+bounded parsing, path handling, and similar safeguards as reliability features
+against mistakes and malformed personal data, not as security boundaries or a
+multi-user threat model.
