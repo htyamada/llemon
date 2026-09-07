@@ -18,7 +18,7 @@ class DocumentViewTestCase(TestCase):
 
         override = override_settings(
             DOCUMENT_VIEWER_ROOT=self.root,
-            DOCUMENT_VIEWER_ACTIVE_DIR=self.active,
+            DOCUMENT_VIEWER_EXPORTS_DIR=self.active,
             DOCUMENT_VIEWER_CACHE_DIR=self.cache,
             DOCUMENT_VIEWER_AUTHORIZE=(
                 lambda request, action: request.user.is_authenticated

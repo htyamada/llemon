@@ -29,7 +29,7 @@ expected to mount this app; nothing here assumes it will.
 
 ## Configuration
 
-`root` and `active_dir` are filesystem paths and live in the repo's own
+`root` and `exports_dir` are filesystem paths and live in the repo's own
 `etc/documentview.conf` -- a visible, versioned TOML file following the
 same convention as `etc/imhandler.conf`/`etc/llemon_djview.conf` (sections
 keyed `[<variant>.documentview.core]`, parsed via the shared
@@ -40,7 +40,7 @@ edit is needed for the common case:
 ```toml
 [hty7.documentview.core]
 root = "/srv/cloud/store/books-and-text/"      # required, no default
-active_dir = "~/var/documentview/reader"        # required, no default
+exports_dir = "~/var/documentview/reader"       # required, no default
 ```
 
 `apps.py`'s `ready()` loads this file into the `appconfig` module via
@@ -52,9 +52,9 @@ developer's own home directory -- both roots run through
 `Path(...).expanduser().resolve()`.
 
 A host's Django settings, when set, still take precedence over the conf
-file -- `DOCUMENT_VIEWER_ROOT` and `DOCUMENT_VIEWER_ACTIVE_DIR` both follow
+file -- `DOCUMENT_VIEWER_ROOT` and `DOCUMENT_VIEWER_EXPORTS_DIR` both follow
 "host setting wins; otherwise the conf-file value" (`config.root()`/
-`config.active_dir()`). This is what lets tests point each one at a fresh
+`config.exports_dir()`). This is what lets tests point each one at a fresh
 temp directory via `override_settings` without touching the real conf
 file; a host project isn't expected to set these in `settings.py` under
 normal operation.
@@ -103,16 +103,16 @@ adversarial documents beyond these limits is out of scope for v1.
 
 **Config validation is lazy, not at startup.** `AppConfig.ready()` only
 checks that each setting is present and of the right type (a pure
-string/`PurePath` comparison that `DOCUMENT_VIEWER_ACTIVE_DIR` isn't inside
+string/`PurePath` comparison that `DOCUMENT_VIEWER_EXPORTS_DIR` isn't inside
 `DOCUMENT_VIEWER_ROOT`, and that `DOCUMENT_VIEWER_CACHE_DIR` isn't inside
-`DOCUMENT_VIEWER_ACTIVE_DIR` -- the exports-directory lock file lives under
+`DOCUMENT_VIEWER_EXPORTS_DIR` -- the exports-directory lock file lives under
 the cache dir, so this containment is what keeps it from ever landing
 inside the exports directory itself) -- no filesystem access, so
 `manage.py check`, migrations, and unrelated management commands never
 fail just because a deployment mount happens to be absent. The equivalent
-live check (that the configured root exists, and that the active dir /
+live check (that the configured root exists, and that the exports dir /
 cache dir both resolve outside the root, and the cache dir outside the
-active dir) runs once per process, the first time a view or management
+exports dir) runs once per process, the first time a view or management
 command actually touches the filesystem -- including the Exports page and
 `exports/prune/`, which validate live config just like `browse()`/`view()`
 do via `paths.resolve_*()`.
@@ -242,8 +242,10 @@ serves the explicitly selected file, never a substituted preferred format.
 ## Exports Directory
 
 `active.py` is directory-is-authority: whatever symlink physically exists
-in `DOCUMENT_VIEWER_ACTIVE_DIR` (still the technical/setting name; the
-user-facing term is "exports directory") *is* an export link, full stop.
+in `DOCUMENT_VIEWER_EXPORTS_DIR` (the module and its functions -- `active.py`,
+`add_active()`, `remove_active()`, `ActiveError` -- keep the older "active"
+name; the setting and user-facing term are both "exports directory") *is*
+an export link, full stop.
 There is no separate manifest recording ownership or intent, and nothing
 is ever "foreign" the way an older manifest-backed design would treat an
 unregistered symlink -- presence as a symlink in that one configured
@@ -266,7 +268,7 @@ must never create metadata there.
   deleted -- the one safety net kept, matching the "prevent accidents, not
   attacks" trust model below.
 - **`remove_active(link_name)`** only ever unlinks a symlink directly
-  inside `DOCUMENT_VIEWER_ACTIVE_DIR` (`dir_fd`-relative unlink, target
+  inside `DOCUMENT_VIEWER_EXPORTS_DIR` (`dir_fd`-relative unlink, target
   never followed or touched). Removal always succeeds once "is a symlink
   at this name" is confirmed, regardless of whether its target still
   validates -- missing (including a symlink loop), outside the collection
@@ -282,7 +284,7 @@ must never create metadata there.
   target that resolves outside `DOCUMENT_VIEWER_ROOT` is `outside_root`;
   only then do not-a-file / unreadable / unsupported-suffix apply.
 - **Badge lookup is a deliberately-lossy set, not a link registry.**
-  `active_badge_paths()` scans `active_dir`, keeps only links
+  `active_badge_paths()` scans `exports_dir`, keeps only links
   `_classify_link()` reports no reason for, and returns the **set** of
   their real paths (a plain, display-only `Path.resolve()`, not the
   hardened O_NOFOLLOW resolver used to actually open files) -- used only
@@ -292,11 +294,11 @@ must never create metadata there.
   in-hierarchy curated symlink directory like `humble-bundle/selected/`)
   resolving to the same real file collapse to one set entry, which is
   correct for an existence check. The Exports page and bulk-invalid
-  cleanup never go through this set -- they iterate `active_dir` directly,
+  cleanup never go through this set -- they iterate `exports_dir` directly,
   one row per directory entry, since two hand-created links pointing at
   the same target must still appear (and be individually removable) as
   two separate rows.
-- **Enumeration rules for `active_dir`**, applied consistently everywhere
+- **Enumeration rules for `exports_dir`**, applied consistently everywhere
   it's scanned (badge lookup, the Exports page, `reconcile()`,
   `remove_invalid()`): hidden entries (name starting with `.`) are always
   skipped entirely -- macOS metadata like `.DS_Store`/`._*` transiently
@@ -328,7 +330,7 @@ must never create metadata there.
 *same* `browse.html` template and cover/title-toggle UI as any other
 directory (an `exports_mode` flag swaps the breadcrumb/heading and adds
 the "Invalid links"/"Unexpected files" sections below the grid), but is
-populated by scanning `active_dir` directly rather than a collection
+populated by scanning `exports_dir` directly rather than a collection
 directory: each valid symlink becomes a one-off, single-variant
 `LogicalDocument` (reusing `documents.LogicalDocument`/`Variant`, so tiles,
 covers, and downloads need no new rendering code), with `view`/`cover`/

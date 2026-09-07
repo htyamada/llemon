@@ -32,8 +32,8 @@ class LimitTests(DocumentViewTestCase):
 
 
 class EmptyRootFallbackTests(DocumentViewTestCase):
-    """Regression: an explicitly empty DOCUMENT_VIEWER_ROOT/_ACTIVE_DIR
-    setting used to be treated as "set" by root()/active_dir() (only a
+    """Regression: an explicitly empty DOCUMENT_VIEWER_ROOT/_EXPORTS_DIR
+    setting used to be treated as "set" by root()/exports_dir() (only a
     bare `None` fell back to etc/documentview.conf), while validate_shape()
     already treated it as unset. That mismatch let `Path('')` -- the
     process's working directory -- silently stand in for a real root.
@@ -50,16 +50,16 @@ class EmptyRootFallbackTests(DocumentViewTestCase):
                 with self.assertRaises(ImproperlyConfigured):
                     config.root()
 
-    def test_empty_active_dir_setting_falls_back_to_appconfig(self):
-        with override_settings(DOCUMENT_VIEWER_ACTIVE_DIR=''):
-            with mock.patch.object(config.appconfig, 'active_dir', str(self.active)):
-                self.assertEqual(config.active_dir(), self.active.resolve())
+    def test_empty_exports_dir_setting_falls_back_to_appconfig(self):
+        with override_settings(DOCUMENT_VIEWER_EXPORTS_DIR=''):
+            with mock.patch.object(config.appconfig, 'exports_dir', str(self.active)):
+                self.assertEqual(config.exports_dir(), self.active.resolve())
 
-    def test_empty_active_dir_setting_with_empty_appconfig_raises(self):
-        with override_settings(DOCUMENT_VIEWER_ACTIVE_DIR=''):
-            with mock.patch.object(config.appconfig, 'active_dir', ''):
+    def test_empty_exports_dir_setting_with_empty_appconfig_raises(self):
+        with override_settings(DOCUMENT_VIEWER_EXPORTS_DIR=''):
+            with mock.patch.object(config.appconfig, 'exports_dir', ''):
                 with self.assertRaises(ImproperlyConfigured):
-                    config.active_dir()
+                    config.exports_dir()
 
     def test_validate_shape_treats_empty_root_setting_as_unconfigured_when_appconfig_also_empty(self):
         with override_settings(DOCUMENT_VIEWER_ROOT=''):
@@ -67,27 +67,27 @@ class EmptyRootFallbackTests(DocumentViewTestCase):
                 config.validate_shape()  # must not raise -- "app installed but not configured"
 
 
-class CacheDirInsideActiveDirTests(DocumentViewTestCase):
+class CacheDirInsideExportsDirTests(DocumentViewTestCase):
     """Regression: the exports-directory lock file lives at
     `active_lock_path() == cache_dir() / 'active.lock'`. If
     DOCUMENT_VIEWER_CACHE_DIR is configured to equal, or nest inside,
-    DOCUMENT_VIEWER_ACTIVE_DIR, the lock file would land inside the exports
-    directory itself -- exactly what moving the lock out of active_dir was
-    meant to prevent. Only ROOT-vs-ACTIVE_DIR/CACHE_DIR containment used to
-    be checked; CACHE_DIR-vs-ACTIVE_DIR was not.
+    DOCUMENT_VIEWER_EXPORTS_DIR, the lock file would land inside the exports
+    directory itself -- exactly what moving the lock out of exports_dir was
+    meant to prevent. Only ROOT-vs-EXPORTS_DIR/CACHE_DIR containment used to
+    be checked; CACHE_DIR-vs-EXPORTS_DIR was not.
     """
 
-    def test_validate_shape_rejects_cache_dir_equal_to_active_dir(self):
+    def test_validate_shape_rejects_cache_dir_equal_to_exports_dir(self):
         with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active)):
             with self.assertRaises(ImproperlyConfigured):
                 config.validate_shape()
 
-    def test_validate_shape_rejects_cache_dir_nested_inside_active_dir(self):
+    def test_validate_shape_rejects_cache_dir_nested_inside_exports_dir(self):
         with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active / 'nested')):
             with self.assertRaises(ImproperlyConfigured):
                 config.validate_shape()
 
-    def test_validate_live_rejects_cache_dir_nested_inside_active_dir(self):
+    def test_validate_live_rejects_cache_dir_nested_inside_exports_dir(self):
         with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active / 'nested')):
             with self.assertRaises(ImproperlyConfigured):
                 config.validate_live()

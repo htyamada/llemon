@@ -202,15 +202,15 @@ def browse(request, rel_path=''):
 
 
 def _exports_context(request, *, notice=None, error=None):
-    """Scan `active_dir` directly, one row per **symlink** entry -- not
+    """Scan `exports_dir` directly, one row per **symlink** entry -- not
     through `active.active_badge_paths()`, which is badge-only (§1). Hidden
     entries are skipped entirely; a non-symlink entry is never classified,
     it's surfaced separately as an "unexpected file".
     """
     config.validate_live()  # same live config check browse()/view() get via paths.resolve_*()
-    active_dir = config.active_dir()
+    exports_dir = config.exports_dir()
     try:
-        entries = list(os.scandir(active_dir))
+        entries = list(os.scandir(exports_dir))
     except OSError:
         entries = []
     entries.sort(key=lambda e: e.name)
@@ -231,7 +231,7 @@ def _exports_context(request, *, notice=None, error=None):
             unexpected_entries.append(name)
             continue
 
-        reason, real = active._classify_link(active_dir / name)
+        reason, real = active._classify_link(exports_dir / name)
         if reason is not None:
             invalid_links.append({'link_name': name, 'label': active.REASON_LABELS[reason]})
             continue

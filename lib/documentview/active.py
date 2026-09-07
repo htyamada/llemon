@@ -1,6 +1,6 @@
 """Exports-directory staging (directory-is-authority model).
 
-Whatever symlink physically exists in `DOCUMENT_VIEWER_ACTIVE_DIR` *is* an
+Whatever symlink physically exists in `DOCUMENT_VIEWER_EXPORTS_DIR` *is* an
 export link -- full stop. There is no separate manifest recording
 ownership or intent; the directory's actual symlinks are the sole source
 of truth. add/remove/reconcile operations acquire an `fcntl.flock` lock on
@@ -72,7 +72,7 @@ def _validate_link_name(link_name: str) -> None:
 
 
 def _classify_link(link_path: Path):
-    """Classify a symlink under `active_dir` from its own resolved target
+    """Classify a symlink under `exports_dir` from its own resolved target
     (not a trusted rel_path -- a hand-created symlink can point anywhere).
 
     Returns `(reason, real_path)`; `reason is None` means the link is a
@@ -117,8 +117,8 @@ def active_badge_paths() -> set:
     resolver used to actually open files.
     """
     try:
-        active_dir = config.active_dir()
-        entries = list(os.scandir(active_dir))
+        exports_dir = config.exports_dir()
+        entries = list(os.scandir(exports_dir))
     except OSError:
         return set()
 
@@ -132,7 +132,7 @@ def active_badge_paths() -> set:
                 continue
         except OSError:
             continue
-        reason, real = _classify_link(active_dir / name)
+        reason, real = _classify_link(exports_dir / name)
         if reason is None:
             found.add(real)
     return found
@@ -152,9 +152,9 @@ def add_active(source_rel_path: str) -> str:
         link_name = source_abs.name
 
     with _locked():
-        active_dir = config.active_dir()
-        active_dir.mkdir(parents=True, exist_ok=True)
-        link_path = active_dir / link_name
+        exports_dir = config.exports_dir()
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        link_path = exports_dir / link_name
 
         if not os.path.lexists(link_path):
             try:
@@ -186,7 +186,7 @@ def add_active(source_rel_path: str) -> str:
 
 def remove_active(link_name: str) -> RemoveResult:
     """Remove an export link. Only ever unlinks a symlink directly inside
-    `DOCUMENT_VIEWER_ACTIVE_DIR` -- never an arbitrary path, and never the
+    `DOCUMENT_VIEWER_EXPORTS_DIR` -- never an arbitrary path, and never the
     link's target. Presence as a symlink is the only authorization needed;
     there is no separate registry to check membership against.
 
@@ -196,8 +196,8 @@ def remove_active(link_name: str) -> RemoveResult:
     _validate_link_name(link_name)
 
     with _locked():
-        active_dir = config.active_dir()
-        dir_fd = os.open(active_dir, os.O_RDONLY | os.O_DIRECTORY)
+        exports_dir = config.exports_dir()
+        dir_fd = os.open(exports_dir, os.O_RDONLY | os.O_DIRECTORY)
         try:
             try:
                 st = os.lstat(link_name, dir_fd=dir_fd)
@@ -206,7 +206,7 @@ def remove_active(link_name: str) -> RemoveResult:
             if not stat.S_ISLNK(st.st_mode):
                 raise ActiveError(f'"{link_name}" is not a symlink; refusing to remove it')
 
-            reason, _real = _classify_link(active_dir / link_name)
+            reason, _real = _classify_link(exports_dir / link_name)
 
             try:
                 os.unlink(link_name, dir_fd=dir_fd)
@@ -226,9 +226,9 @@ def remove_invalid() -> int:
     """
     removed = 0
     with _locked():
-        active_dir = config.active_dir()
+        exports_dir = config.exports_dir()
         try:
-            entries = list(os.scandir(active_dir))
+            entries = list(os.scandir(exports_dir))
         except OSError:
             entries = []
         for entry in entries:
@@ -240,11 +240,11 @@ def remove_invalid() -> int:
                     continue
             except OSError:
                 continue
-            reason, _real = _classify_link(active_dir / name)
+            reason, _real = _classify_link(exports_dir / name)
             if reason is None:
                 continue
             try:
-                os.unlink(active_dir / name)
+                os.unlink(exports_dir / name)
             except OSError:
                 continue
             removed += 1
@@ -261,10 +261,10 @@ def reconcile(repair: bool = False) -> list:
     """
     issues = []
     with _locked():
-        active_dir = config.active_dir()
-        active_dir.mkdir(parents=True, exist_ok=True)
+        exports_dir = config.exports_dir()
+        exports_dir.mkdir(parents=True, exist_ok=True)
         try:
-            entries = list(os.scandir(active_dir))
+            entries = list(os.scandir(exports_dir))
         except OSError:
             entries = []
         entries.sort(key=lambda e: e.name)
@@ -284,7 +284,7 @@ def reconcile(repair: bool = False) -> list:
                 )
                 continue
 
-            link_path = active_dir / name
+            link_path = exports_dir / name
             reason, _real = _classify_link(link_path)
             if reason is None:
                 continue

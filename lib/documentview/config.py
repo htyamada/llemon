@@ -1,15 +1,15 @@
 """Settings, defaults, and validation for the documentview app.
 
-`root` and `active_dir` normally come from the repo's own
+`root` and `exports_dir` normally come from the repo's own
 `etc/documentview.conf` (loaded into the `appconfig` module by
 `apps.py`'s `ready()`, following the same convention as
 `etc/imhandler.conf`/`etc/llemon_djview.conf`). A host's
-`DOCUMENT_VIEWER_ROOT`/`DOCUMENT_VIEWER_ACTIVE_DIR` Django setting, when
+`DOCUMENT_VIEWER_ROOT`/`DOCUMENT_VIEWER_EXPORTS_DIR` Django setting, when
 present *and non-empty*, wins over the conf file (see `_configured()`) --
 this is what lets tests point each of these at a fresh temp directory via
 `override_settings` without touching the real conf. A setting explicitly
 set to `''` is treated as not set, rather than being resolved as
-`Path('')` -- the process's working directory; `root()`/`active_dir()`
+`Path('')` -- the process's working directory; `root()`/`exports_dir()`
 raise `ImproperlyConfigured` outright if nothing configures them.
 
 `AppConfig.ready()` calls `validate_shape()`, which only checks that each
@@ -19,8 +19,8 @@ pure string/PurePath comparison -- no filesystem access. That way
 fail just because a deployment mount happens to be absent.
 
 The equivalent live check (that the configured root exists, that the
-cache dir / active dir both resolve outside DOCUMENT_VIEWER_ROOT, and that
-the cache dir resolves outside the active dir -- `active_lock_path()`
+cache dir / exports dir both resolve outside DOCUMENT_VIEWER_ROOT, and that
+the cache dir resolves outside the exports dir -- `active_lock_path()`
 lives under the cache dir, so this is what keeps the lock file from ever
 landing inside the exports directory) runs lazily, once per process, the
 first time a view or management command actually touches the filesystem
@@ -91,12 +91,12 @@ def root() -> Path:
     return Path(value).expanduser().resolve()
 
 
-def active_dir() -> Path:
-    value = _configured('DOCUMENT_VIEWER_ACTIVE_DIR', appconfig.active_dir)
+def exports_dir() -> Path:
+    value = _configured('DOCUMENT_VIEWER_EXPORTS_DIR', appconfig.exports_dir)
     if not value:
         raise ImproperlyConfigured(
-            'DOCUMENT_VIEWER_ACTIVE_DIR is not configured (set active_dir in etc/documentview.conf, '
-            'or the DOCUMENT_VIEWER_ACTIVE_DIR setting)'
+            'DOCUMENT_VIEWER_EXPORTS_DIR is not configured (set exports_dir in etc/documentview.conf, '
+            'or the DOCUMENT_VIEWER_EXPORTS_DIR setting)'
         )
     return Path(value).expanduser().resolve()
 
@@ -109,7 +109,7 @@ def cache_dir() -> Path:
 def active_lock_path() -> Path:
     """Lock file guarding add/remove/prune of the exports directory.
     Deliberately under `DOCUMENT_VIEWER_CACHE_DIR`, not
-    `DOCUMENT_VIEWER_ACTIVE_DIR` -- the exports directory is exported
+    `DOCUMENT_VIEWER_EXPORTS_DIR` -- the exports directory is exported
     as-is to external sync software/devices, and the app must never
     create metadata inside it.
     """
@@ -145,11 +145,11 @@ def limit(name: str):
 def validate_shape() -> None:
     """Startup-safe validation: types and non-overlap only, no filesystem access.
 
-    `root`/`active_dir` normally come from `etc/documentview.conf` (already
+    `root`/`exports_dir` normally come from `etc/documentview.conf` (already
     loaded into the `appconfig` module by the time `ready()` calls this),
-    with the DOCUMENT_VIEWER_ROOT/DOCUMENT_VIEWER_ACTIVE_DIR Django
+    with the DOCUMENT_VIEWER_ROOT/DOCUMENT_VIEWER_EXPORTS_DIR Django
     settings, when set, taking precedence -- same lookup order as
-    `root()`/`active_dir()`.
+    `root()`/`exports_dir()`.
     """
     root_value = _configured('DOCUMENT_VIEWER_ROOT', appconfig.root)
     if not root_value:
@@ -157,14 +157,14 @@ def validate_shape() -> None:
     if not isinstance(root_value, (str, PurePath)):
         raise ImproperlyConfigured('DOCUMENT_VIEWER_ROOT must be a path')
 
-    active_value = _configured('DOCUMENT_VIEWER_ACTIVE_DIR', appconfig.active_dir)
-    if not active_value:
+    exports_value = _configured('DOCUMENT_VIEWER_EXPORTS_DIR', appconfig.exports_dir)
+    if not exports_value:
         raise ImproperlyConfigured(
-            'DOCUMENT_VIEWER_ACTIVE_DIR is required when DOCUMENT_VIEWER_ROOT is set '
-            '(set active_dir in etc/documentview.conf or the DOCUMENT_VIEWER_ACTIVE_DIR setting)'
+            'DOCUMENT_VIEWER_EXPORTS_DIR is required when DOCUMENT_VIEWER_ROOT is set '
+            '(set exports_dir in etc/documentview.conf or the DOCUMENT_VIEWER_EXPORTS_DIR setting)'
         )
-    if not isinstance(active_value, (str, PurePath)):
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR must be a path')
+    if not isinstance(exports_value, (str, PurePath)):
+        raise ImproperlyConfigured('DOCUMENT_VIEWER_EXPORTS_DIR must be a path')
 
     cache_value = getattr(settings, 'DOCUMENT_VIEWER_CACHE_DIR', DEFAULT_CACHE_DIR)
     if not isinstance(cache_value, (str, PurePath)):
@@ -180,14 +180,14 @@ def validate_shape() -> None:
 
     # Pure string/PurePath comparison; no expanduser()/resolve(), no filesystem access.
     root_pure = PurePath(root_value)
-    active_pure = PurePath(active_value)
-    if active_pure == root_pure or root_pure in active_pure.parents:
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR must not be inside DOCUMENT_VIEWER_ROOT')
+    exports_pure = PurePath(exports_value)
+    if exports_pure == root_pure or root_pure in exports_pure.parents:
+        raise ImproperlyConfigured('DOCUMENT_VIEWER_EXPORTS_DIR must not be inside DOCUMENT_VIEWER_ROOT')
 
     cache_pure = PurePath(cache_value)
-    if cache_pure == active_pure or active_pure in cache_pure.parents:
+    if cache_pure == exports_pure or exports_pure in cache_pure.parents:
         raise ImproperlyConfigured(
-            'DOCUMENT_VIEWER_CACHE_DIR must not be inside DOCUMENT_VIEWER_ACTIVE_DIR '
+            'DOCUMENT_VIEWER_CACHE_DIR must not be inside DOCUMENT_VIEWER_EXPORTS_DIR '
             '(the exports-directory lock file lives under the cache dir -- see active_lock_path())'
         )
 
@@ -199,10 +199,10 @@ def validate_live() -> None:
     validated in turn rather than only the first).
     """
     resolved_root = root()
-    resolved_active = active_dir()
+    resolved_exports = exports_dir()
     resolved_cache = cache_dir()
 
-    cache_key = (resolved_root, resolved_active, resolved_cache)
+    cache_key = (resolved_root, resolved_exports, resolved_cache)
     if cache_key in _validated_configs:
         return
 
@@ -210,19 +210,19 @@ def validate_live() -> None:
         raise ImproperlyConfigured(f'DOCUMENT_VIEWER_ROOT does not exist or is not a directory: {resolved_root}')
 
     for name, path in (
-        ('DOCUMENT_VIEWER_ACTIVE_DIR', resolved_active),
+        ('DOCUMENT_VIEWER_EXPORTS_DIR', resolved_exports),
         ('DOCUMENT_VIEWER_CACHE_DIR', resolved_cache),
     ):
         if path == resolved_root or resolved_root in path.parents:
             raise ImproperlyConfigured(f'{name} must resolve outside DOCUMENT_VIEWER_ROOT: {path}')
 
-    if resolved_cache == resolved_active or resolved_active in resolved_cache.parents:
+    if resolved_cache == resolved_exports or resolved_exports in resolved_cache.parents:
         raise ImproperlyConfigured(
-            f'DOCUMENT_VIEWER_CACHE_DIR must resolve outside DOCUMENT_VIEWER_ACTIVE_DIR '
+            f'DOCUMENT_VIEWER_CACHE_DIR must resolve outside DOCUMENT_VIEWER_EXPORTS_DIR '
             f'(the exports-directory lock file lives under the cache dir): {resolved_cache}'
         )
 
-    resolved_active.mkdir(parents=True, exist_ok=True)
+    resolved_exports.mkdir(parents=True, exist_ok=True)
     resolved_cache.mkdir(parents=True, exist_ok=True)
 
     _validated_configs.add(cache_key)

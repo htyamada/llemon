@@ -12,7 +12,7 @@ class DocumentViewerIntegrationTests(TestCase):
             root.mkdir()
             with self.settings(
                 DOCUMENT_VIEWER_ROOT=root,
-                DOCUMENT_VIEWER_ACTIVE_DIR=active,
+                DOCUMENT_VIEWER_EXPORTS_DIR=active,
                 DOCUMENT_VIEWER_CACHE_DIR=Path(temp_dir) / 'cache',
             ):
                 response = self.client.get('/documents/')

@@ -27,13 +27,13 @@ class DocumentViewAppConfigTests(unittest.TestCase):
         ac = mock.Mock()
         ac.get.side_effect = lambda _project, _layer, key: {
             'root': '  /srv/books  ',
-            'active_dir': '  ~/var/documentview/reader  ',
+            'exports_dir': '  ~/var/documentview/reader  ',
         }[key]
 
         appconfig.init(ac)
 
         self.assertEqual(appconfig.root, '/srv/books')
-        self.assertEqual(appconfig.active_dir, '~/var/documentview/reader')
+        self.assertEqual(appconfig.exports_dir, '~/var/documentview/reader')
 
     def test_init_defaults_missing_values_to_empty_string(self) -> None:
         ac = mock.Mock()
@@ -42,7 +42,7 @@ class DocumentViewAppConfigTests(unittest.TestCase):
         appconfig.init(ac)
 
         self.assertEqual(appconfig.root, '')
-        self.assertEqual(appconfig.active_dir, '')
+        self.assertEqual(appconfig.exports_dir, '')
 
 
 if __name__ == '__main__':

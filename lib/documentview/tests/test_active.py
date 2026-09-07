@@ -636,7 +636,7 @@ class ExportsPageTests(DocumentViewClientTestCase):
         self.assertTrue((self.active / 'LinkB.epub').exists())
 
     def test_exports_index_validates_live_config_before_scanning(self):
-        # Regression: _exports_context() used to scan active_dir directly
+        # Regression: _exports_context() used to scan exports_dir directly
         # without ever calling config.validate_live() -- the check
         # browse()/view() get for free via paths.resolve_*(). A missing or
         # misconfigured root would otherwise render a silently-empty
