@@ -15,6 +15,21 @@ config lives under `imhandler/`.
 The active consumers of these shared Django apps are `llime` and
 `../qat/knip`.
 
+## Deployment and Change Scope
+
+Grove has two instances, running on separate servers for a single host.
+They are generally started and restarted together; there are no other
+instances or third-party consumers. `../qat/knip` imports some Grove
+libraries, so changes to shared code should be checked against both
+in-repository consumers.
+
+There is one user: the person configuring, operating, and requesting
+changes to the system. Requested, coordinated changes to configuration or
+shared-library interfaces are therefore not unexpected external API breaks
+and do not normally need backwards-compatibility aliases. Review and manage
+unintended side effects in Grove and qat instead. Preserve compatibility
+only when it is needed by an in-repository consumer or explicitly requested.
+
 Templates are stored per app in `templates/`, and static assets are under each
 app’s `static/` directory. Tests, where present, use each app’s `tests.py`.
 
@@ -63,8 +78,9 @@ run, note config or deployment impacts, and include screenshots for UI changes.
 
 Do not commit secrets or machine-local config. Runtime settings come from files
 under `~/etc/`, while generated logs and caches live under `~/var/`. Shared apps
-may be imported by host projects through `sys.path`, so keep public module names
-stable and document path changes in both host settings and `lib/*` docs.
+may be imported by `llime` and qat through `sys.path`; keep their interfaces
+consistent across those consumers and document coordinated path changes in the
+relevant settings and `lib/*` docs.
 
 ### Operational Trust Model
 
