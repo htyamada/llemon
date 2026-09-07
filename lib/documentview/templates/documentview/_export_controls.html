@@ -1,0 +1,13 @@
+{% load documentview_extras %}
+<div class="dv-export-controls">
+{% for suffix, variant in doc.variants.items %}
+  {% if suffix not in active %}
+  <form method="post" action="{% url 'documentview:active_add' %}" class="dv-active-form">
+    {% csrf_token %}
+    <input type="hidden" name="rel_path" value="{{ variant.rel_path }}">
+    <input type="hidden" name="return_to" value="{{ request.get_full_path }}">
+    <button type="submit">Add {{ suffix|upper }} to exports</button>
+  </form>
+  {% endif %}
+{% endfor %}
+</div>

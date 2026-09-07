@@ -1,23 +1,12 @@
 import os
 import threading
 
-from .. import active, documents, views
+from django.core.exceptions import ImproperlyConfigured
+from django.test import override_settings
+
+from .. import active, documents, paths, views
 from .base import DocumentViewTestCase
 from .test_download import DocumentViewClientTestCase
-
-
-def _seed_manifest_entry(self, link_name, source_rel_path):
-    """Directly inject a manifest entry + matching symlink, bypassing
-    `add_active()`. Used only to reach states `add_active()` itself would
-    never produce (e.g. a manifest entry recording a source whose suffix
-    is no longer supported) -- reachable in practice only via a hand-edited
-    manifest or a config change, not through the app's own add path.
-    """
-    manifest = active._read_manifest()
-    manifest[link_name] = {'source': source_rel_path}
-    active._write_manifest(manifest)
-    self.active.mkdir(parents=True, exist_ok=True)
-    (self.active / link_name).symlink_to(self.root / source_rel_path)
 
 
 class AddActiveTests(DocumentViewTestCase):
@@ -28,56 +17,64 @@ class AddActiveTests(DocumentViewTestCase):
         self.assertEqual(name1, name2)
         self.assertEqual(len(list(self.active.iterdir())), 1)
 
-    def test_registered_but_symlink_missing_is_reported_not_repaired(self):
-        self.touch('a/Book.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
-        with self.assertRaises(active.MismatchError):
-            active.add_active('a/Book.epub')
-        # No implicit repair: still nothing on disk.
-        self.assertFalse((self.active / 'Book.epub').exists())
-
-    def test_registered_but_symlink_points_elsewhere_is_reported(self):
-        self.touch('a/Book.epub')
-        other = self.touch('a/Other.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
-        (self.active / 'Book.epub').symlink_to(other)
-        with self.assertRaises(active.MismatchError):
-            active.add_active('a/Book.epub')
-
-    def test_foreign_symlink_at_computed_name_rejected_without_adoption(self):
-        self.touch('a/Book.epub')
-        elsewhere = self.tmp / 'elsewhere.epub'
-        elsewhere.write_bytes(b'x')
+    def test_add_replaces_dangling_symlink_at_destination_name(self):
+        # Regression: a destination name occupied by a dangling symlink
+        # must not be misrouted into "create fresh" (a follow-symlinks
+        # existence check reports a dangling symlink as absent) and then
+        # fail with FileExistsError -- lexists() sees the directory entry
+        # and the dangling link is treated as just another "wrong target"
+        # to replace.
+        source = self.touch('a/Book.epub')
         self.active.mkdir(parents=True, exist_ok=True)
-        (self.active / 'Book.epub').symlink_to(elsewhere)
+        (self.active / 'Book.epub').symlink_to(self.tmp / 'does-not-exist')
 
-        with self.assertRaises(active.CollisionError):
+        name = active.add_active('a/Book.epub')
+
+        self.assertEqual(name, 'Book.epub')
+        self.assertEqual((self.active / 'Book.epub').resolve(), source.resolve())
+
+    def test_add_replaces_symlink_pointing_elsewhere(self):
+        # Conflict resolution: latest write wins, not an error.
+        source = self.touch('a/Book.epub')
+        other = self.touch('a/Other.epub')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Book.epub').symlink_to(other)
+
+        active.add_active('a/Book.epub')
+
+        self.assertEqual((self.active / 'Book.epub').resolve(), source.resolve())
+
+    def test_add_refuses_non_symlink_entry_at_computed_name(self):
+        self.touch('a/Book.epub')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Book.epub').write_bytes(b'not a symlink')
+
+        with self.assertRaises(active.ActiveError):
             active.add_active('a/Book.epub')
 
-        # Untouched: still points at the foreign target, and no manifest entry.
-        self.assertEqual(os.readlink(self.active / 'Book.epub'), str(elsewhere))
-        self.assertEqual(active.load_manifest_sources(), {})
+        self.assertEqual((self.active / 'Book.epub').read_bytes(), b'not a symlink')
 
-    def test_same_filename_different_directory_is_collision(self):
+    def test_same_filename_different_directory_replaces_link(self):
+        # Behavior change from the old manifest model: activating a second
+        # document with the same filename as an already-active one now
+        # replaces the old link instead of requiring deactivation first.
         self.touch('a/Book.epub')
         self.touch('b/Book.epub')
         active.add_active('a/Book.epub')
-        with self.assertRaises(active.CollisionError):
-            active.add_active('b/Book.epub')
+        active.add_active('b/Book.epub')
+
+        self.assertEqual((self.active / 'Book.epub').resolve(), (self.root / 'b/Book.epub').resolve())
+        self.assertEqual(len(list(self.active.iterdir())), 1)
 
     def test_activating_one_variant_leaves_siblings_untouched(self):
         self.touch('a/Book.epub')
         self.touch('a/Book.pdf')
         active.add_active('a/Book.epub')
-        self.assertIsNone(active.find_link_for_source('a/Book.pdf'))
-        self.assertEqual(active.find_link_for_source('a/Book.epub'), 'Book.epub')
         self.assertEqual(len(list(self.active.iterdir())), 1)
+        self.assertTrue((self.active / 'Book.epub').exists())
+        self.assertFalse((self.active / 'Book.pdf').exists())
 
     def test_add_active_rejects_invalid_source(self):
-        from .. import paths
-
         with self.assertRaises(paths.PathError):
             active.add_active('../etc/passwd')
 
@@ -87,35 +84,32 @@ class RemoveActiveTests(DocumentViewTestCase):
         self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
         result = active.remove_active('Book.epub')
-        self.assertEqual(result.reason, None)
+        self.assertIsNone(result.reason)
         self.assertFalse((self.active / 'Book.epub').exists())
-        self.assertEqual(active.load_manifest_sources(), {})
 
     def test_remove_refuses_unregistered_name(self):
         self.active.mkdir(parents=True, exist_ok=True)
-        # Not registered at all -> ActiveError before any filesystem check.
         with self.assertRaises(active.ActiveError):
-            active.remove_active('not-registered.epub')
+            active.remove_active('not-there.epub')
 
-    def test_remove_refuses_foreign_symlink_even_if_named_like_a_source(self):
-        # A symlink exists on disk under this name, but it was never
-        # created through add_active -- the manifest has no entry for it,
-        # so remove must refuse rather than treating "is a symlink" alone
-        # as sufficient authorization.
-        target = self.touch('a/Foreign.epub')
+    def test_remove_succeeds_for_a_hand_created_symlink(self):
+        # Directory-is-authority: presence as a symlink in the exports
+        # directory is the only authorization needed, whether or not the
+        # app itself created it -- nothing is "foreign" any more.
+        target = self.touch('a/HandCreated.epub')
         self.active.mkdir(parents=True, exist_ok=True)
-        (self.active / 'Foreign.epub').symlink_to(target)
-        with self.assertRaises(active.ActiveError):
-            active.remove_active('Foreign.epub')
-        self.assertTrue((self.active / 'Foreign.epub').is_symlink())
+        (self.active / 'HandCreated.epub').symlink_to(target)
 
-    def test_remove_refuses_registered_name_that_is_now_a_plain_file(self):
-        self.touch('a/Book.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
+        result = active.remove_active('HandCreated.epub')
+        self.assertIsNone(result.reason)
+        self.assertFalse((self.active / 'HandCreated.epub').exists())
+
+    def test_remove_refuses_non_symlink_entry(self):
+        self.active.mkdir(parents=True, exist_ok=True)
         (self.active / 'Book.epub').write_bytes(b'not a symlink')
         with self.assertRaises(active.ActiveError):
             active.remove_active('Book.epub')
+        self.assertTrue((self.active / 'Book.epub').exists())
 
     def test_remove_cannot_smuggle_arbitrary_path(self):
         with self.assertRaises(active.ActiveError):
@@ -149,14 +143,24 @@ class RemoveActiveTests(DocumentViewTestCase):
             source.chmod(0o644)
         self.assertEqual(result.reason, active.REASON_UNREADABLE)
 
-    def test_remove_succeeds_when_source_no_longer_supported_suffix(self):
-        # A recorded source's suffix can't change via a rename (the rel_path
-        # string is what's recorded), so reaching this classification means
-        # seeding a manifest entry directly, as a hand-edited manifest or a
-        # config change to SUPPORTED_SUFFIXES might produce.
-        self.touch('a/Book.exe')
-        _seed_manifest_entry(self, 'Book.exe', 'a/Book.exe')
-        result = active.remove_active('Book.exe')
+    def test_remove_succeeds_when_target_outside_root(self):
+        # New, first-class case a manifest-recorded source (always
+        # collection-relative by construction) could never reach: a
+        # hand-created symlink pointing entirely outside the collection.
+        outside = self.tmp / 'outside.pdf'
+        outside.write_bytes(b'not part of the collection')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Escape.pdf').symlink_to(outside)
+
+        result = active.remove_active('Escape.pdf')
+        self.assertEqual(result.reason, active.REASON_OUTSIDE_ROOT)
+
+    def test_remove_succeeds_when_target_unsupported_suffix(self):
+        target = self.touch('a/Notes.exe')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Notes.exe').symlink_to(target)
+
+        result = active.remove_active('Notes.exe')
         self.assertEqual(result.reason, active.REASON_UNSUPPORTED)
 
     def test_remove_never_follows_or_removes_target(self):
@@ -165,6 +169,43 @@ class RemoveActiveTests(DocumentViewTestCase):
         active.remove_active('Book.epub')
         self.assertTrue(source.exists())
         self.assertEqual(source.read_bytes(), b'original content')
+
+
+class ClassifyLinkTests(DocumentViewTestCase):
+    def test_missing_target(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Gone.epub').symlink_to(self.tmp / 'nope')
+        reason, real = active._classify_link(self.active / 'Gone.epub')
+        self.assertEqual(reason, active.REASON_MISSING)
+        self.assertIsNone(real)
+
+    def test_symlink_loop_classified_as_missing_not_an_unhandled_exception(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        loop_a = self.active / 'LoopA'
+        loop_b = self.active / 'LoopB'
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+
+        reason, real = active._classify_link(loop_a)
+        self.assertEqual(reason, active.REASON_MISSING)
+        self.assertIsNone(real)
+
+    def test_outside_root(self):
+        outside = self.tmp / 'outside.pdf'
+        outside.write_bytes(b'x')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Escape.pdf').symlink_to(outside)
+
+        reason, real = active._classify_link(self.active / 'Escape.pdf')
+        self.assertEqual(reason, active.REASON_OUTSIDE_ROOT)
+        self.assertIsNone(real)
+
+    def test_valid_link(self):
+        source = self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        reason, real = active._classify_link(self.active / 'Book.epub')
+        self.assertIsNone(reason)
+        self.assertEqual(real, source.resolve())
 
 
 class ConcurrencyTests(DocumentViewTestCase):
@@ -184,9 +225,7 @@ class ConcurrencyTests(DocumentViewTestCase):
         for t in threads:
             t.join()
 
-        # Every thread either succeeded (idempotent) or hit a reported
-        # mismatch; none silently corrupted the manifest/filesystem pair.
-        self.assertEqual(active.load_manifest_sources(), {'a/Book.epub': 'Book.epub'})
+        self.assertEqual(errors, [])
         self.assertTrue((self.active / 'Book.epub').is_symlink())
         self.assertEqual(len(list(self.active.iterdir())), 1)
 
@@ -208,61 +247,36 @@ class ConcurrencyTests(DocumentViewTestCase):
             t.join()
 
         # Exactly one remove can succeed; the rest see a clean "not
-        # registered" error. Either way, disk and manifest end up agreeing.
+        # present" error. Either way, the directory ends up consistent.
         successes = [r for r in results if isinstance(r, active.RemoveResult)]
         self.assertEqual(len(successes), 1)
-        self.assertEqual(active.load_manifest_sources(), {})
         self.assertFalse((self.active / 'Book.epub').exists())
 
 
 class ReconcileTests(DocumentViewTestCase):
-    def test_reports_missing_symlink_with_valid_source(self):
+    def test_no_issues_when_everything_consistent(self):
         self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
+        self.assertEqual(active.reconcile(repair=False), [])
+
+    def test_hand_created_symlink_is_a_normal_valid_link_not_foreign(self):
+        target = self.touch('a/Book.epub')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Book.epub').symlink_to(target)
+        self.assertEqual(active.reconcile(repair=False), [])
+
+    def test_reports_invalid_link_when_source_missing(self):
+        source = self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        source.unlink()
 
         issues = active.reconcile(repair=False)
         self.assertEqual(len(issues), 1)
-        self.assertEqual(issues[0].kind, 'missing_symlink')
+        self.assertEqual(issues[0].kind, 'invalid_link')
         self.assertFalse(issues[0].repaired)
-        # No repair happened.
-        self.assertFalse((self.active / 'Book.epub').exists())
+        self.assertTrue((self.active / 'Book.epub').is_symlink())  # not repaired
 
-    def test_repair_recreates_missing_symlink_for_valid_source(self):
-        self.touch('a/Book.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
-
-        issues = active.reconcile(repair=True)
-        self.assertTrue(issues[0].repaired)
-        self.assertTrue((self.active / 'Book.epub').is_symlink())
-
-    def test_reports_broken_source_for_each_classification(self):
-        cases = [
-            ('missing', 'epub', lambda p: p.unlink()),
-            ('not_a_file', 'epub', lambda p: (p.unlink(), p.mkdir())),
-            ('unreadable', 'epub', lambda p: p.chmod(0o000)),
-            ('unsupported_type', 'exe', lambda p: None),
-        ]
-        for suffix_case, ext, mutate in cases:
-            with self.subTest(suffix_case):
-                source = self.touch(f'a/{suffix_case}.{ext}')
-                if ext == 'exe':
-                    _seed_manifest_entry(self, f'{suffix_case}.exe', f'a/{suffix_case}.exe')
-                else:
-                    active.add_active(f'a/{suffix_case}.epub')
-                    mutate(source)
-                issues = active.reconcile(repair=False)
-                broken = [i for i in issues if i.kind == 'broken_source']
-                self.assertEqual(len(broken), 1, issues)
-                self.assertFalse(broken[0].repaired)
-                try:
-                    source.chmod(0o644)
-                except OSError:
-                    pass
-                active.remove_active(f'{suffix_case}.{ext}')
-
-    def test_repair_removes_broken_source_link_and_entry(self):
+    def test_repair_removes_invalid_link(self):
         source = self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
         source.unlink()
@@ -270,94 +284,74 @@ class ReconcileTests(DocumentViewTestCase):
         issues = active.reconcile(repair=True)
         self.assertTrue(issues[0].repaired)
         self.assertFalse((self.active / 'Book.epub').exists())
-        self.assertEqual(active.load_manifest_sources(), {})
 
-    def test_foreign_symlink_reported_but_never_removed(self):
-        target = self.touch('a/Foreign.epub')
-        self.active.mkdir(parents=True, exist_ok=True)
-        (self.active / 'Foreign.epub').symlink_to(target)
-
-        issues = active.reconcile(repair=True)
-        foreign = [i for i in issues if i.kind == 'foreign']
-        self.assertEqual(len(foreign), 1)
-        self.assertFalse(foreign[0].repaired)
-        self.assertTrue((self.active / 'Foreign.epub').is_symlink())
-
-    def test_no_issues_when_everything_consistent(self):
-        self.touch('a/Book.epub')
-        active.add_active('a/Book.epub')
-        self.assertEqual(active.reconcile(repair=False), [])
-
-    def test_repair_never_creates_a_link_escaping_the_collection_root(self):
-        # A manifest `source` is untrusted (hand-edited or corrupted); a
-        # traversal path must never be treated as a valid, relinkable
-        # source just because a file happens to exist there.
+    def test_reports_link_pointing_outside_root(self):
         outside = self.tmp / 'outside.pdf'
-        outside.write_bytes(b'not part of the collection')
-        manifest = active._read_manifest()
-        manifest['Escape.pdf'] = {'source': '../outside.pdf'}
-        active._write_manifest(manifest)
-
-        issues = active.reconcile(repair=True)
-        self.assertFalse((self.active / 'Escape.pdf').exists())
-        self.assertNotIn('Escape.pdf', active._read_manifest())
-        self.assertTrue(any(i.link_name == 'Escape.pdf' for i in issues))
-
-    def test_repair_never_acts_on_an_invalid_link_name(self):
-        # A manifest key containing `/` or `..` can never name a real
-        # app-managed link (active_dir / link_name would escape active_dir)
-        # -- it must be reported/dropped, not used to build a path.
-        self.touch('a/Book.epub')
-        manifest = active._read_manifest()
-        manifest['../evil'] = {'source': 'a/Book.epub'}
-        active._write_manifest(manifest)
-
-        issues = active.reconcile(repair=True)
-        invalid = [i for i in issues if i.kind == 'invalid_entry']
-        self.assertEqual(len(invalid), 1)
-        self.assertTrue(invalid[0].repaired)
-        self.assertNotIn('../evil', active._read_manifest())
-        self.assertFalse((self.tmp / 'evil').exists())
-
-    def test_reports_symlink_pointing_at_the_wrong_target(self):
-        self.touch('a/Book.epub')
-        other = self.touch('a/Other.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
-        (self.active / 'Book.epub').symlink_to(other)
+        outside.write_bytes(b'x')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Escape.pdf').symlink_to(outside)
 
         issues = active.reconcile(repair=False)
-        wrong = [i for i in issues if i.kind == 'wrong_target']
-        self.assertEqual(len(wrong), 1)
-        self.assertFalse(wrong[0].repaired)
-        self.assertEqual(os.readlink(self.active / 'Book.epub'), str(other))
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].kind, 'invalid_link')
+        self.assertIn('outside the collection', issues[0].detail)
 
-    def test_repair_relinks_a_symlink_pointing_at_the_wrong_target(self):
-        source = self.touch('a/Book.epub')
-        other = self.touch('a/Other.epub')
-        active.add_active('a/Book.epub')
-        (self.active / 'Book.epub').unlink()
-        (self.active / 'Book.epub').symlink_to(other)
+    def test_unexpected_non_symlink_entry_reported_and_never_repaired(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'stray.txt').write_bytes(b'not from this app')
 
         issues = active.reconcile(repair=True)
-        wrong = [i for i in issues if i.kind == 'wrong_target']
-        self.assertEqual(len(wrong), 1)
-        self.assertTrue(wrong[0].repaired)
-        self.assertEqual(os.readlink(self.active / 'Book.epub'), str(source))
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].kind, 'unexpected_entry')
+        self.assertFalse(issues[0].repaired)
+        self.assertTrue((self.active / 'stray.txt').exists())
+
+    def test_hidden_entries_are_never_reported(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / '.DS_Store').write_bytes(b'macos metadata')
+        self.assertEqual(active.reconcile(repair=True), [])
+        self.assertTrue((self.active / '.DS_Store').exists())
+
+
+class RemoveInvalidTests(DocumentViewTestCase):
+    def test_removes_every_invalid_link(self):
+        source = self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        source.unlink()
+
+        outside = self.tmp / 'outside.pdf'
+        outside.write_bytes(b'x')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'Escape.pdf').symlink_to(outside)
+
+        removed = active.remove_invalid()
+        self.assertEqual(removed, 2)
+        self.assertEqual(list(self.active.iterdir()), [])
+
+    def test_leaves_valid_links_and_unexpected_files_alone(self):
+        self.touch('a/Good.epub')
+        active.add_active('a/Good.epub')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'stray.txt').write_bytes(b'not from this app')
+
+        removed = active.remove_invalid()
+        self.assertEqual(removed, 0)
+        self.assertTrue((self.active / 'Good.epub').exists())
+        self.assertTrue((self.active / 'stray.txt').exists())
+
+    def test_no_invalid_links_returns_zero(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(active.remove_invalid(), 0)
 
 
 class ActiveHttpTests(DocumentViewClientTestCase):
-    def test_add_then_remove_round_trip_through_views(self):
+    def test_add_hides_the_add_control_and_shows_a_notice(self):
         self.touch('a/Book.epub')
         r = self.post('/documents/active/add/', {'rel_path': 'a/Book.epub'})
         self.assertEqual(r.status_code, 200)
-        self.assertIn(b'Remove from reader', r.content)
-        self.assertEqual(active.find_link_for_source('a/Book.epub'), 'Book.epub')
-
-        r2 = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'rel_path': 'a/Book.epub'})
-        self.assertEqual(r2.status_code, 200)
-        self.assertIn(b'Add to reader', r2.content)
-        self.assertIsNone(active.find_link_for_source('a/Book.epub'))
+        self.assertNotIn(b'Add to exports', r.content)
+        self.assertIn(b'Added', r.content)
+        self.assertIn(b'Exports', r.content)
 
     def test_active_add_requires_mutate_authorization(self):
         from django.test import Client
@@ -372,42 +366,42 @@ class ActiveHttpTests(DocumentViewClientTestCase):
         r = self.get('/documents/active/add/?rel_path=a/Book.epub')
         self.assertEqual(r.status_code, 405)
 
-    def test_browse_shows_reader_badge_after_activation(self):
+    def test_browse_shows_export_badge_after_activation(self):
         self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
         r = self.get('/documents/browse/a/')
-        self.assertIn(b'reader', r.content)
+        self.assertIn(b'exported', r.content)
 
-    def test_browse_offers_per_format_reader_controls_in_both_views(self):
+    def test_browse_offers_add_control_only_for_non_exported_formats(self):
         self.touch('a/Book.epub')
         self.touch('a/Book.pdf')
+        active.add_active('a/Book.epub')
         for mode in ('cover', 'title'):
             r = self.get(f'/documents/browse/a/?view={mode}')
-            self.assertContains(r, 'Add EPUB to reader')
-            self.assertContains(r, 'Add PDF to reader')
+            self.assertNotContains(r, 'Add EPUB to exports')
+            self.assertContains(r, 'Add PDF to exports')
 
-    def test_add_and_remove_from_browse_return_to_the_listing(self):
+    def test_browse_never_offers_a_remove_control(self):
+        self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        r = self.get('/documents/browse/a/')
+        self.assertNotIn(b'Remove from exports', r.content)
+
+    def test_view_page_never_offers_a_remove_control(self):
+        self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        r = self.get('/documents/view/a/Book.epub/')
+        self.assertNotIn(b'Remove from exports', r.content)
+        self.assertNotIn(b'Add to exports', r.content)  # already exported
+
+    def test_add_from_browse_returns_to_the_listing(self):
         self.touch('a/Book.epub')
         listing = '/documents/browse/a/?view=cover'
 
-        added = self.post(
-            '/documents/active/add/',
-            {'rel_path': 'a/Book.epub', 'return_to': listing},
-        )
+        added = self.post('/documents/active/add/', {'rel_path': 'a/Book.epub', 'return_to': listing})
         self.assertRedirects(added, listing, fetch_redirect_response=False)
         r = self.get(listing)
-        self.assertContains(r, 'Remove EPUB from reader')
-
-        removed = self.post(
-            '/documents/active/remove/',
-            {
-                'link_name': 'Book.epub',
-                'rel_path': 'a/Book.epub',
-                'return_to': listing,
-            },
-        )
-        self.assertRedirects(removed, listing, fetch_redirect_response=False)
-        self.assertIsNone(active.find_link_for_source('a/Book.epub'))
+        self.assertContains(r, 'exported')
 
     def test_mutation_does_not_redirect_to_an_external_host(self):
         self.touch('a/Book.epub')
@@ -416,14 +410,14 @@ class ActiveHttpTests(DocumentViewClientTestCase):
             {'rel_path': 'a/Book.epub', 'return_to': 'https://example.com/'},
         )
         self.assertEqual(r.status_code, 200)
-        self.assertIn(b'Remove from reader', r.content)
+        self.assertIn(b'Added', r.content)
 
     def test_remove_succeeds_through_the_view_when_source_is_missing(self):
-        # Regression: the endpoint must operate on link_name (manifest
-        # identity) first. Resolving rel_path back to a document is only
-        # for choosing a page to render -- it must never gate the removal
-        # itself, since "the source is gone" is exactly the case this
-        # endpoint exists to clean up (spec 1.5/4.5).
+        # Regression: the endpoint must operate on link_name alone.
+        # Resolving rel_path back to a document is only for choosing a
+        # page to render -- it must never gate the removal itself, since
+        # "the source is gone" is exactly the case this endpoint exists to
+        # clean up.
         source = self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
         source.unlink()
@@ -431,7 +425,6 @@ class ActiveHttpTests(DocumentViewClientTestCase):
         r = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'rel_path': 'a/Book.epub'})
         self.assertEqual(r.status_code, 200)
         self.assertIn(b'the source file is missing', r.content)
-        self.assertIsNone(active.find_link_for_source('a/Book.epub'))
         self.assertFalse((self.active / 'Book.epub').exists())
 
     def test_remove_succeeds_through_the_view_when_source_replaced_by_directory(self):
@@ -442,7 +435,7 @@ class ActiveHttpTests(DocumentViewClientTestCase):
 
         r = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'rel_path': 'a/Book.epub'})
         self.assertEqual(r.status_code, 200)
-        self.assertIsNone(active.find_link_for_source('a/Book.epub'))
+        self.assertFalse((self.active / 'Book.epub').exists())
 
     def test_remove_renders_fallback_page_when_no_rel_path_resolves(self):
         source = self.touch('a/Book.epub')
@@ -454,17 +447,17 @@ class ActiveHttpTests(DocumentViewClientTestCase):
         r = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'rel_path': 'a/Book.epub'})
         self.assertEqual(r.status_code, 200)
         self.assertIn(b'Back to Document View', r.content)
-        self.assertIsNone(active.find_link_for_source('a/Book.epub'))
+        self.assertFalse((self.active / 'Book.epub').exists())
 
 
 class SymlinkedSourceActiveStateTests(DocumentViewTestCase):
     """Regression: the real collection curates books by symlinking them
     into `humble-bundle/selected/` from sibling directories. Browse lists
     such a document under the *symlink's* path, while `add_active()`
-    records the resolved *target* path -- so a naive reverse lookup keyed
-    only on the canonical source never matched, and the reader badge /
-    "Remove from reader" button never appeared for exactly the directory
-    the user curates.
+    creates the export link at the resolved target's filename. Badge
+    lookup must still recognize the document as exported under both the
+    curated path and its real path, since both resolve to the same real
+    file -- no separate alias bookkeeping needed.
     """
 
     def _selected_layout(self):
@@ -473,29 +466,19 @@ class SymlinkedSourceActiveStateTests(DocumentViewTestCase):
         (self.root / 'selected' / 'Book.epub').symlink_to(target)
         return target
 
-    def test_activating_via_symlink_marks_both_paths_active(self):
+    def test_activating_via_symlink_badges_both_paths(self):
         self._selected_layout()
         active.add_active('selected/Book.epub')
 
-        sources = active.load_manifest_sources()
-        self.assertEqual(sources.get('selected/Book.epub'), 'Book.epub')
-        self.assertEqual(sources.get('real/Book.epub'), 'Book.epub')
+        exported = active.active_badge_paths()
+        real = (self.root / 'real' / 'Book.epub').resolve()
+        self.assertIn(real, exported)
 
-    def test_badge_lookup_matches_the_listed_symlink_path(self):
-        self._selected_layout()
-        active.add_active('selected/Book.epub')
+        _, selected_docs = documents.scan_directory(self.root / 'selected', 'selected')
+        self.assertEqual(views._variant_real_path(selected_docs[0].variants['epub']), real)
 
-        _, docs = documents.scan_directory(self.root / 'selected', 'selected')
-        variant = documents.representative_variant(docs[0])
-        self.assertEqual(variant.rel_path, 'selected/Book.epub')
-        self.assertEqual(active.find_link_for_source(variant.rel_path), 'Book.epub')
-
-    def test_manifest_records_canonical_source_as_identity(self):
-        self._selected_layout()
-        active.add_active('selected/Book.epub')
-        manifest = active._read_manifest()
-        self.assertEqual(manifest['Book.epub']['source'], 'real/Book.epub')
-        self.assertEqual(manifest['Book.epub']['requested'], 'selected/Book.epub')
+        _, real_docs = documents.scan_directory(self.root / 'real', 'real')
+        self.assertEqual(views._variant_real_path(real_docs[0].variants['epub']), real)
 
     def test_activating_target_directly_is_the_same_link(self):
         # Same underlying file, reached two ways -- must collapse to one
@@ -506,36 +489,12 @@ class SymlinkedSourceActiveStateTests(DocumentViewTestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(list(self.active.iterdir())), 1)
 
-    def test_activating_canonical_then_alias_still_records_the_alias(self):
-        # Regression: activating the canonical path first used to return
-        # early on the later alias activation (already active, same
-        # source) without ever recording the alias -- so the curated
-        # `selected/` directory kept showing the document as inactive.
-        self._selected_layout()
-        active.add_active('real/Book.epub')
-        active.add_active('selected/Book.epub')
-
-        manifest = active._read_manifest()
-        self.assertEqual(manifest['Book.epub']['requested'], 'selected/Book.epub')
-        self.assertEqual(active.find_link_for_source('selected/Book.epub'), 'Book.epub')
-
-    def test_direct_activation_needs_no_requested_key(self):
-        self.touch('real/Book.epub')
-        active.add_active('real/Book.epub')
-        self.assertNotIn('requested', active._read_manifest()['Book.epub'])
-
-    def test_removal_still_works_and_clears_both_lookups(self):
-        self._selected_layout()
-        active.add_active('selected/Book.epub')
-        active.remove_active('Book.epub')
-        self.assertEqual(active.load_manifest_sources(), {})
-
-    def test_view_page_offers_remove_for_a_symlinked_document(self):
+    def test_view_page_offers_no_remove_control_for_a_symlinked_document(self):
         self._selected_layout()
         active.add_active('selected/Book.epub')
         _, docs = documents.scan_directory(self.root / 'selected', 'selected')
         rows = views._variant_rows(docs[0])
-        self.assertEqual(rows[0]['active_link'], 'Book.epub')
+        self.assertTrue(rows[0]['exported'])
 
 
 class SymlinkedSourceLogicalGroupingTests(DocumentViewClientTestCase):
@@ -573,55 +532,116 @@ class SymlinkedSourceLogicalGroupingTests(DocumentViewClientTestCase):
         self.assertIn(b'Alias.pdf', r.content)
         self.assertIn(b'PDF', r.content)
 
-    def test_activating_through_the_view_records_the_alias_not_the_canonical_path(self):
+    def test_activating_through_the_view_exports_the_canonical_target(self):
         self._aliased_layout()
         r = self.post('/documents/active/add/', {'rel_path': 'selected/Alias.epub'})
         self.assertEqual(r.status_code, 200)
-        manifest = active._read_manifest()
-        self.assertEqual(manifest['Canonical.epub']['source'], 'real/Canonical.epub')
-        self.assertEqual(manifest['Canonical.epub']['requested'], 'selected/Alias.epub')
-        self.assertEqual(active.find_link_for_source('selected/Alias.epub'), 'Canonical.epub')
+        self.assertTrue((self.active / 'Canonical.epub').is_symlink())
+        self.assertEqual(
+            (self.active / 'Canonical.epub').resolve(), (self.root / 'real/Canonical.epub').resolve()
+        )
 
 
-class CorruptManifestTests(DocumentViewClientTestCase):
-    def _corrupt_manifest(self):
-        self.manifest.parent.mkdir(parents=True, exist_ok=True)
-        self.manifest.write_text('this is not valid json {{{')
-
-    def test_add_active_raises_manifest_error_rather_than_silently_colliding(self):
-        self.touch('a/Book.epub')
-        self._corrupt_manifest()
-        with self.assertRaises(active.ManifestError):
-            active.add_active('a/Book.epub')
-
-    def test_remove_active_raises_manifest_error_rather_than_reporting_foreign(self):
+class ExportsPageTests(DocumentViewClientTestCase):
+    def test_lists_valid_export(self):
         self.touch('a/Book.epub')
         active.add_active('a/Book.epub')
-        self._corrupt_manifest()
-        with self.assertRaises(active.ManifestError):
-            active.remove_active('Book.epub')
-
-    def test_reconcile_raises_manifest_error(self):
-        self._corrupt_manifest()
-        with self.assertRaises(active.ManifestError):
-            active.reconcile(repair=False)
-
-    def test_load_manifest_sources_degrades_gracefully_for_display(self):
-        self._corrupt_manifest()
-        # Display-only lookups must not break browsing; they log and
-        # degrade to "nothing known active" instead of raising.
-        self.assertEqual(active.load_manifest_sources(), {})
-
-    def test_missing_manifest_file_is_legitimately_empty_not_an_error(self):
-        self.assertFalse(self.manifest.exists())
-        self.assertEqual(active.load_manifest_sources(), {})
-        self.touch('a/Book.epub')
-        active.add_active('a/Book.epub')  # must not raise
-        self.assertEqual(active.find_link_for_source('a/Book.epub'), 'Book.epub')
-
-    def test_active_add_view_surfaces_manifest_error_instead_of_500(self):
-        self.touch('a/Book.epub')
-        self._corrupt_manifest()
-        r = self.post('/documents/active/add/', {'rel_path': 'a/Book.epub'})
+        r = self.get('/documents/exports/')
         self.assertEqual(r.status_code, 200)
-        self.assertIn(b'not valid JSON', r.content)
+        self.assertContains(r, 'Book')
+        self.assertContains(r, 'Remove from exports')
+
+    def test_lists_invalid_link_with_reason(self):
+        source = self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        source.unlink()
+        r = self.get('/documents/exports/')
+        self.assertContains(r, 'Book.epub')
+        self.assertContains(r, 'the source file is missing')
+        self.assertContains(r, 'Delete all invalid links')
+
+    def test_lists_unexpected_non_symlink_entry(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'stray.txt').write_bytes(b'not from this app')
+        r = self.get('/documents/exports/')
+        self.assertContains(r, 'Unexpected files')
+        self.assertContains(r, 'stray.txt')
+
+    def test_hidden_entries_are_never_listed(self):
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / '.DS_Store').write_bytes(b'macos metadata')
+        r = self.get('/documents/exports/')
+        self.assertNotContains(r, '.DS_Store')
+
+    def test_prune_deletes_all_invalid_links(self):
+        source = self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        source.unlink()
+
+        r = self.post('/documents/exports/prune/', {})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse((self.active / 'Book.epub').exists())
+        self.assertContains(r, 'Deleted 1 invalid link')
+
+    def test_prune_with_nothing_invalid_reports_none_deleted(self):
+        r = self.post('/documents/exports/prune/', {})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'No invalid links to delete')
+
+    def test_remove_control_removes_and_returns_to_the_listing(self):
+        self.touch('a/Book.epub')
+        active.add_active('a/Book.epub')
+        listing = '/documents/exports/'
+
+        r = self.post('/documents/active/remove/', {'link_name': 'Book.epub', 'return_to': listing})
+        self.assertRedirects(r, listing, fetch_redirect_response=False)
+        self.assertFalse((self.active / 'Book.epub').exists())
+
+    def test_exports_index_requires_browse_authorization(self):
+        from django.test import Client
+
+        anon = Client()
+        r = anon.get('/documents/exports/', HTTP_HOST='localhost')
+        self.assertEqual(r.status_code, 403)
+
+    def test_prune_requires_mutate_authorization(self):
+        from django.test import Client
+
+        anon = Client()
+        r = anon.post('/documents/exports/prune/', {}, HTTP_HOST='localhost')
+        self.assertEqual(r.status_code, 403)
+
+    def test_exports_link_appears_on_the_collection_page(self):
+        r = self.get('/documents/')
+        self.assertContains(r, 'dv-exports-link')
+        self.assertContains(r, '/documents/exports/')
+
+    def test_duplicate_links_to_the_same_target_are_each_individually_removable(self):
+        # Regression: two link names resolving to the same real file must
+        # not collide on a rel_path-keyed lookup -- each row's "Remove"
+        # form must carry its own link_name, not whichever one happened to
+        # be processed last.
+        target = self.touch('a/Book.epub')
+        self.active.mkdir(parents=True, exist_ok=True)
+        (self.active / 'LinkA.epub').symlink_to(target)
+        (self.active / 'LinkB.epub').symlink_to(target)
+
+        r = self.get('/documents/exports/')
+        self.assertContains(r, 'name="link_name" value="LinkA.epub"')
+        self.assertContains(r, 'name="link_name" value="LinkB.epub"')
+
+        removed = self.post('/documents/active/remove/', {'link_name': 'LinkA.epub'})
+        self.assertEqual(removed.status_code, 200)
+        self.assertFalse((self.active / 'LinkA.epub').exists())
+        self.assertTrue((self.active / 'LinkB.epub').exists())
+
+    def test_exports_index_validates_live_config_before_scanning(self):
+        # Regression: _exports_context() used to scan active_dir directly
+        # without ever calling config.validate_live() -- the check
+        # browse()/view() get for free via paths.resolve_*(). A missing or
+        # misconfigured root would otherwise render a silently-empty
+        # Exports page instead of surfacing the configuration error.
+        missing_root = self.tmp / 'does-not-exist'
+        with override_settings(DOCUMENT_VIEWER_ROOT=missing_root):
+            with self.assertRaises(ImproperlyConfigured):
+                self.get('/documents/exports/')

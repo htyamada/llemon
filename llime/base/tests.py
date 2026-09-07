@@ -14,7 +14,6 @@ class DocumentViewerIntegrationTests(TestCase):
                 DOCUMENT_VIEWER_ROOT=root,
                 DOCUMENT_VIEWER_ACTIVE_DIR=active,
                 DOCUMENT_VIEWER_CACHE_DIR=Path(temp_dir) / 'cache',
-                DOCUMENT_VIEWER_ACTIVE_MANIFEST=Path(temp_dir) / 'manifest.json',
             ):
                 response = self.client.get('/documents/')
 

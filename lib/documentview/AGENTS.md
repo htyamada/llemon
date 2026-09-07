@@ -12,8 +12,9 @@ subresources they reference; `archives.py` is the bounded/streamed ZIP
 reader shared by EPUB/CBZ code; `images.py` is the shared bounded-image
 decode helper; `epub.py` is shared EPUB container/OPF parsing;
 `pdfrender.py` wraps the `pdftoppm` subprocess; `subresources.py` signs
-archive-internal preview identifiers; `active.py` owns the active-reader
-manifest and locked symlink staging; `appconfig.py` loads the filesystem
+archive-internal preview identifiers; `active.py` owns the exports
+directory's locked, directory-is-authority symlink staging;
+`appconfig.py` loads the filesystem
 paths from `etc/documentview.conf`; `config.py` owns settings, defaults,
 and lazy filesystem validation; `views.py` / `urls.py` wire it all up.
 Templates live under `templates/documentview/`, static assets under
@@ -28,19 +29,18 @@ expected to mount this app; nothing here assumes it will.
 
 ## Configuration
 
-`root`, `active_dir`, and `active_manifest` are filesystem paths and live
-in the repo's own `etc/documentview.conf` -- a visible, versioned TOML file
-following the same convention as `etc/imhandler.conf`/`etc/llemon_djview.conf`
-(sections keyed `[<variant>.documentview.core]`, parsed via the shared
+`root` and `active_dir` are filesystem paths and live in the repo's own
+`etc/documentview.conf` -- a visible, versioned TOML file following the
+same convention as `etc/imhandler.conf`/`etc/llemon_djview.conf` (sections
+keyed `[<variant>.documentview.core]`, parsed via the shared
 `hty7.config.AppConfig`). Edit that file directly to change where the
-collection root or the active-reader directory live; no code or Django
-settings edit is needed for the common case:
+collection root or the exports directory live; no code or Django settings
+edit is needed for the common case:
 
 ```toml
 [hty7.documentview.core]
 root = "/srv/cloud/store/books-and-text/"      # required, no default
 active_dir = "~/var/documentview/reader"        # required, no default
-active_manifest = "~/var/documentview/state/active_manifest.json"  # optional
 ```
 
 `apps.py`'s `ready()` loads this file into the `appconfig` module via
@@ -52,13 +52,12 @@ developer's own home directory -- both roots run through
 `Path(...).expanduser().resolve()`.
 
 A host's Django settings, when set, still take precedence over the conf
-file -- `DOCUMENT_VIEWER_ROOT`, `DOCUMENT_VIEWER_ACTIVE_DIR`, and
-`DOCUMENT_VIEWER_ACTIVE_MANIFEST` all follow "host setting wins; otherwise
-the conf-file value" (`config.root()`/`config.active_dir()`/
-`config.active_manifest_path()`). This is what lets tests point each one
-at a fresh temp directory via `override_settings` without touching the
-real conf file; a host project isn't expected to set these in
-`settings.py` under normal operation.
+file -- `DOCUMENT_VIEWER_ROOT` and `DOCUMENT_VIEWER_ACTIVE_DIR` both follow
+"host setting wins; otherwise the conf-file value" (`config.root()`/
+`config.active_dir()`). This is what lets tests point each one at a fresh
+temp directory via `override_settings` without touching the real conf
+file; a host project isn't expected to set these in `settings.py` under
+normal operation.
 
 Optional, with defaults:
 
@@ -105,13 +104,18 @@ adversarial documents beyond these limits is out of scope for v1.
 **Config validation is lazy, not at startup.** `AppConfig.ready()` only
 checks that each setting is present and of the right type (a pure
 string/`PurePath` comparison that `DOCUMENT_VIEWER_ACTIVE_DIR` isn't inside
-`DOCUMENT_VIEWER_ROOT`) -- no filesystem access, so `manage.py check`,
-migrations, and unrelated management commands never fail just because a
-deployment mount happens to be absent. The equivalent live check (that the
-configured root exists, and that the active dir / cache dir / manifest /
-manifest lock file all resolve outside the root) runs once per process,
-the first time a view or management command actually touches the
-filesystem.
+`DOCUMENT_VIEWER_ROOT`, and that `DOCUMENT_VIEWER_CACHE_DIR` isn't inside
+`DOCUMENT_VIEWER_ACTIVE_DIR` -- the exports-directory lock file lives under
+the cache dir, so this containment is what keeps it from ever landing
+inside the exports directory itself) -- no filesystem access, so
+`manage.py check`, migrations, and unrelated management commands never
+fail just because a deployment mount happens to be absent. The equivalent
+live check (that the configured root exists, and that the active dir /
+cache dir both resolve outside the root, and the cache dir outside the
+active dir) runs once per process, the first time a view or management
+command actually touches the filesystem -- including the Exports page and
+`exports/prune/`, which validate live config just like `browse()`/`view()`
+do via `paths.resolve_*()`.
 
 ## Dependencies
 
@@ -235,80 +239,115 @@ Download preserves exact original bytes, filename, and attachment
 disposition; each format variant has its own download URL and always
 serves the explicitly selected file, never a substituted preferred format.
 
-## Active-Reader Staging
+## Exports Directory
 
-`active.py` maintains an app-controlled JSON manifest (default
-`~/var/documentview/state/active_manifest.json`, deliberately outside
-`DOCUMENT_VIEWER_ACTIVE_DIR` so reader-sync software never sees it) mapping
-active-link names to their canonical source. Each entry is
-`{"source": "<canonical rel_path>"}`, plus `"requested"` when the document
-was activated through an in-hierarchy symlink (as the real collection's
-curated `humble-bundle/selected/` directory does): `source` stays the
-single identity used for collision, idempotency, and source-validity
-checks, while `requested` records the path the user actually acted on so
-the browse/detail pages show the active badge under the path they list the
-file at, not only under the symlink target's own directory.
+`active.py` is directory-is-authority: whatever symlink physically exists
+in `DOCUMENT_VIEWER_ACTIVE_DIR` (still the technical/setting name; the
+user-facing term is "exports directory") *is* an export link, full stop.
+There is no separate manifest recording ownership or intent, and nothing
+is ever "foreign" the way an older manifest-backed design would treat an
+unregistered symlink -- presence as a symlink in that one configured
+directory is the only authorization `remove_active()` needs.
 
-A **missing** manifest legitimately means "no active links yet" and reads
-as empty. A manifest that exists but is unreadable or malformed raises
-`ManifestError`: mutating operations surface it (so a corrupt manifest can
-never make existing managed links look foreign and block their removal),
-while the display-only lookup degrades to "no badges" and logs, so
-browsing still works. All add/remove/reconcile
-operations acquire an `fcntl.flock` lock on a sibling `.lock` file before
-touching either the manifest or the active directory; manifest writes are
-temp-file-plus-`os.replace()` atomic. Crash durability *across* the
-separate manifest and symlink operations is **not** a v1 guarantee -- an
-interrupted operation may leave the two stores disagreeing, which is
-reported clearly rather than silently repaired.
+All add/remove/reconcile/prune operations acquire an `fcntl.flock` lock on
+`config.active_lock_path()` (`DOCUMENT_VIEWER_CACHE_DIR/active.lock`) --
+deliberately *not* inside the exports directory itself, since that
+directory is exported as-is to external sync software/devices and the app
+must never create metadata there.
 
-- `add_active(source)` uses the source's filename as the only candidate
-  link name. If that name is already occupied by a different registered
-  source, or by an unfamiliar filesystem entry, the operation is rejected
-  with a collision error -- it never invents a second name, overwrites, or
-  adopts. Repeating the same add is idempotent only when the on-disk
-  symlink is present and points at the same source; a registered-but-
-  missing-or-wrong symlink is a reported mismatch, not an implicit repair.
-  An idempotent re-confirm still records a not-yet-seen `requested` alias
-  (e.g. the document was first activated as `real/Book.epub` and is now
-  also being activated as `selected/Book.epub`) -- otherwise the curated
-  directory's badge would never appear, since the early "already active"
-  return used to skip updating the manifest entry entirely.
-- `remove_active(link_name)` only ever unlinks a symlink directly inside
-  `DOCUMENT_VIEWER_ACTIVE_DIR` that is registered in the manifest as
-  app-created (`dir_fd`-relative unlink, target never followed or
-  touched). Removal always succeeds once that's confirmed, regardless of
-  whether the registered source still validates -- missing, replaced by a
-  directory, unreadable, or no longer a supported suffix are each reported
-  with their own specific reason rather than a generic failure or silent
-  no-op.
+- **`add_active(source)`** uses the source's filename as the only
+  candidate link name, checked with an `lstat`-style, non-following
+  existence check (a dangling symlink still occupies that directory-entry
+  name). Nothing there -> create the symlink. A symlink there (dangling or
+  not) -> resolves and matches the new source exactly -> idempotent no-op;
+  otherwise (points elsewhere, or is dangling) -> unlink and recreate,
+  conflict resolved as latest-write-wins. A non-symlink entry there (a
+  real file or directory) -> refused and raised, rather than silently
+  deleted -- the one safety net kept, matching the "prevent accidents, not
+  attacks" trust model below.
+- **`remove_active(link_name)`** only ever unlinks a symlink directly
+  inside `DOCUMENT_VIEWER_ACTIVE_DIR` (`dir_fd`-relative unlink, target
+  never followed or touched). Removal always succeeds once "is a symlink
+  at this name" is confirmed, regardless of whether its target still
+  validates -- missing (including a symlink loop), outside the collection
+  root, replaced by a directory, unreadable, or no longer a supported
+  suffix are each reported with their own specific reason
+  (`_classify_link()`'s `REASON_*` constants) rather than a generic
+  failure or silent no-op.
+- **`_classify_link(link_path)`** classifies a symlink from its own
+  resolved target (not a trusted rel_path -- a hand-created symlink can
+  point anywhere): a dangling target or a symlink loop both fold into one
+  `missing` reason (identical handling everywhere, and a hand-created
+  loop is too obscure an edge case to earn a second reason code); a
+  target that resolves outside `DOCUMENT_VIEWER_ROOT` is `outside_root`;
+  only then do not-a-file / unreadable / unsupported-suffix apply.
+- **Badge lookup is a deliberately-lossy set, not a link registry.**
+  `active_badge_paths()` scans `active_dir`, keeps only links
+  `_classify_link()` reports no reason for, and returns the **set** of
+  their real paths (a plain, display-only `Path.resolve()`, not the
+  hardened O_NOFOLLOW resolver used to actually open files) -- used only
+  to answer "is this document currently exported at all" for
+  collection-page badges. Multiple links (including hand-created
+  duplicates, or a document reached both directly and through an
+  in-hierarchy curated symlink directory like `humble-bundle/selected/`)
+  resolving to the same real file collapse to one set entry, which is
+  correct for an existence check. The Exports page and bulk-invalid
+  cleanup never go through this set -- they iterate `active_dir` directly,
+  one row per directory entry, since two hand-created links pointing at
+  the same target must still appear (and be individually removable) as
+  two separate rows.
+- **Enumeration rules for `active_dir`**, applied consistently everywhere
+  it's scanned (badge lookup, the Exports page, `reconcile()`,
+  `remove_invalid()`): hidden entries (name starting with `.`) are always
+  skipped entirely -- macOS metadata like `.DS_Store`/`._*` transiently
+  dropped by Samba sync is invisible to the app, not even flagged. Only
+  symlinks are ever passed to `_classify_link()`; a visible, non-hidden,
+  non-symlink entry is never something the app itself creates (the lock
+  file lives under `DOCUMENT_VIEWER_CACHE_DIR`, never here), so one
+  showing up is flagged as informational only (the Exports page's
+  "Unexpected files" notice, or `reconcile()`'s `unexpected_entry` issue)
+  and never touched by bulk removal or `--repair`.
 - Activation is per underlying format: activating an EPUB never implicitly
   activates or deactivates a sibling PDF variant.
-- `./manage.py documentview_reconcile_active [--repair]` reports manifest
-  entries whose symlink is missing, wrong, or whose source no longer
-  validates, and (only with `--repair`, run explicitly by an operator)
-  recreates, relinks, or drops those app-owned entries. Every manifest
-  `source` and `link_name` is untrusted input -- it can come from a
-  corrupted or hand-edited manifest -- so both are validated/resolved
-  through the same safe, contained, symlink-resolving path
-  (`_resolve_source_candidate()`, `_validate_link_name()`) before any
-  repair action; a `source` containing `..` or resolving outside
-  `DOCUMENT_VIEWER_ROOT`, or a `link_name` containing `/` or `..`, is
-  never trusted enough to create, follow, or unlink a link from. A link
-  that exists and whose source validates but whose target doesn't
-  actually match the registered source (silently replaced with a symlink
-  to something else) is reported/repaired as `wrong_target`, not silently
-  treated as consistent. A symlink present in
-  `DOCUMENT_VIEWER_ACTIVE_DIR` but absent from the manifest is always
-  reported as foreign and **left in place** -- this command never adopts
-  or removes an entry it didn't create, matching the app's only having
-  delete authority over its own app-created symlinks in this one
-  configured directory (spec 1.5). Deletion scope never extends to any
-  other file or directory the web-server account happens to be able to
-  reach.
-- Back up `DOCUMENT_VIEWER_ACTIVE_MANIFEST` like any other small piece of
-  application state you don't want to have to rebuild by hand; it's the
-  sole source of truth for which active-directory symlinks this app owns.
+- `remove_invalid()` (wired to the Exports page's "Delete all invalid
+  links" button and `documentview:exports_prune`) deletes every symlink
+  `_classify_link()` flags with any reason, under the same lock; it never
+  calls `_classify_link()` on a non-symlink entry, so it can't touch an
+  unexpected file.
+- `./manage.py documentview_reconcile_active [--repair]` reports every
+  invalid export symlink (any `REASON_*`, via `_classify_link()`) and, with
+  `--repair`, deletes them -- a pure "remove broken/invalid links" tool; it
+  can no longer recreate a missing symlink, since there's no manifest
+  recording that intent. A visible non-symlink entry is reported as its
+  own `unexpected_entry` issue, informational only, never touched by
+  `--repair`.
+
+### Exports Page
+
+`documentview:exports_index` (`/documents/exports/`) renders through the
+*same* `browse.html` template and cover/title-toggle UI as any other
+directory (an `exports_mode` flag swaps the breadcrumb/heading and adds
+the "Invalid links"/"Unexpected files" sections below the grid), but is
+populated by scanning `active_dir` directly rather than a collection
+directory: each valid symlink becomes a one-off, single-variant
+`LogicalDocument` (reusing `documents.LogicalDocument`/`Variant`, so tiles,
+covers, and downloads need no new rendering code), with `view`/`cover`/
+`download` URLs built from the link's canonical real rel_path so clicking
+through lands on the normal detail page for that document. An invalid
+link (any `_classify_link()` reason) instead renders in a separate
+"Invalid links" list (name + reason + an individual remove button), with
+a "Delete all invalid links" button wired to `remove_invalid()`
+(`documentview:exports_prune`, POST-only). A stray non-symlink entry gets
+its own read-only "Unexpected files" notice, no delete action at all.
+
+Add/remove is asymmetric by page: the Exports page only ever offers
+Remove (every tile there is by definition already exported; there's no
+"add" affordance since the exports-directory browser doesn't create
+links). Collection browse/detail pages only ever offer Add -- once a
+variant is exported, its per-variant action cell (`_export_controls.html`,
+`view.html`'s variant table) shows nothing further, just the existing
+"exported" badge. Removal is therefore reachable from exactly one place
+(the Exports page), regardless of which page the user navigated from.
 
 ## Security Model
 
@@ -397,9 +436,10 @@ policy, TOCTOU), `test_documents.py` (grouping, natural sort),
 `test_covers.py` (extraction, fallbacks, bomb fixtures, fit-and-pad),
 `test_previews.py` (bounded previews, sanitization, signed subresource
 ids), `test_download.py` (exact-byte download, preview subresource HTTP
-behavior), `test_active.py` (add/remove/collision/reconcile, including
-concurrency, symlinked sources, and corrupt manifests),
-`test_headers.py` (the `nosniff`/CSP contract above), and
+behavior), `test_active.py` (add/remove/reconcile/prune, including
+concurrency, symlinked sources, hidden entries, unexpected non-symlink
+entries, and the Exports page), `test_headers.py` (the `nosniff`/CSP
+contract above), and
 `test_config.py` (settings/limit resolution). Each
 `DocumentViewTestCase` (in `tests/base.py`) points
 `DOCUMENT_VIEWER_*` settings at a fresh temp collection per test via

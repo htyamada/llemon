@@ -104,6 +104,13 @@ def _return_after_mutation(request):
     return None
 
 
+def _variant_real_path(variant):
+    """Plain, display-only resolved path for an "exported" badge lookup --
+    not the hardened O_NOFOLLOW resolver used to actually open files.
+    """
+    return config.root().joinpath(*variant.rel_path.split('/')).resolve()
+
+
 def _resolve_logical(rel_path):
     """Resolve a collection-relative path to `(document, resolved)`, or
     `(None, None)` if it doesn't name a valid document. `resolved` (already
@@ -172,12 +179,12 @@ def browse(request, rel_path=''):
     except paths.PathError:
         raise Http404('directory not found')
     subdirs, docs = documents.scan_directory(resolved.abs_path, resolved.rel_path)
-    active_sources = active.load_manifest_sources()
+    exported_paths = active.active_badge_paths()
     active_links = {
         doc.rel_path: {
-            suffix: active_sources[variant.rel_path]
+            suffix
             for suffix, variant in doc.variants.items()
-            if variant.rel_path in active_sources
+            if _variant_real_path(variant) in exported_paths
         }
         for doc in docs
     }
@@ -189,8 +196,108 @@ def browse(request, rel_path=''):
         'active_links': active_links,
         'view_mode': _view_mode(request),
         'format_preference': documents.FORMAT_PREFERENCE,
+        'exports_mode': False,
     }
     return _render_page(request, 'documentview/browse.html', context)
+
+
+def _exports_context(request, *, notice=None, error=None):
+    """Scan `active_dir` directly, one row per **symlink** entry -- not
+    through `active.active_badge_paths()`, which is badge-only (§1). Hidden
+    entries are skipped entirely; a non-symlink entry is never classified,
+    it's surfaced separately as an "unexpected file".
+    """
+    config.validate_live()  # same live config check browse()/view() get via paths.resolve_*()
+    active_dir = config.active_dir()
+    try:
+        entries = list(os.scandir(active_dir))
+    except OSError:
+        entries = []
+    entries.sort(key=lambda e: e.name)
+
+    docs = []
+    invalid_links = []
+    unexpected_entries = []
+
+    for entry in entries:
+        name = entry.name
+        if name.startswith('.'):
+            continue
+        try:
+            is_symlink = entry.is_symlink()
+        except OSError:
+            continue
+        if not is_symlink:
+            unexpected_entries.append(name)
+            continue
+
+        reason, real = active._classify_link(active_dir / name)
+        if reason is not None:
+            invalid_links.append({'link_name': name, 'label': active.REASON_LABELS[reason]})
+            continue
+
+        rel_parts = real.relative_to(config.root()).parts
+        rel_path = '/'.join(rel_parts)
+        suffix = real.suffix.lower()[1:]
+        try:
+            st = real.stat()
+        except OSError:
+            invalid_links.append({'link_name': name, 'label': active.REASON_LABELS[active.REASON_MISSING]})
+            continue
+
+        variant = documents.Variant(
+            suffix=suffix, filename=real.name, rel_path=rel_path,
+            mtime_ns=st.st_mtime_ns, size=st.st_size,
+        )
+        basename, _ = documents.strip_supported_suffix(real.name)
+        doc = documents.LogicalDocument(
+            basename=basename, directory='/'.join(rel_parts[:-1]), variants={suffix: variant},
+        )
+        # Two link names can resolve to the same real file (a hand-created
+        # duplicate), which would collide as a dict key on doc.rel_path --
+        # each row needs its own tile-to-link_name pairing, so it's carried
+        # directly on the one-off doc instance instead.
+        doc.link_name = name
+        docs.append(doc)
+
+    docs.sort(key=lambda d: d.sort_key())
+
+    context = {
+        'rel_path': '',
+        'breadcrumbs': [],
+        'subdirs': [],
+        'documents': docs,
+        'active_links': {},
+        'view_mode': _view_mode(request),
+        'format_preference': documents.FORMAT_PREFERENCE,
+        'exports_mode': True,
+        'invalid_links': invalid_links,
+        'unexpected_entries': unexpected_entries,
+    }
+    if notice:
+        context['active_notice'] = notice
+    if error:
+        context['active_error'] = error
+    return context
+
+
+def exports_index(request):
+    _require(request, 'browse')
+    return _render_page(request, 'documentview/browse.html', _exports_context(request))
+
+
+@require_POST
+def exports_prune(request):
+    _require(request, 'mutate')
+    removed = active.remove_invalid()
+    return_response = _return_after_mutation(request)
+    if return_response is not None:
+        return return_response
+    if removed:
+        notice = f'Deleted {removed} invalid link{"s" if removed != 1 else ""}.'
+    else:
+        notice = 'No invalid links to delete.'
+    return _render_page(request, 'documentview/browse.html', _exports_context(request, notice=notice))
 
 
 def _build_preview(variant):
@@ -228,13 +335,13 @@ def _build_preview(variant):
 
 
 def _variant_rows(document):
-    active_sources = active.load_manifest_sources()
+    exported_paths = active.active_badge_paths()
     rows = []
     for suffix in documents.FORMAT_PREFERENCE:
         variant = document.variants.get(suffix)
         if variant is None:
             continue
-        rows.append({'variant': variant, 'active_link': active_sources.get(variant.rel_path)})
+        rows.append({'variant': variant, 'exported': _variant_real_path(variant) in exported_paths})
     return rows
 
 
@@ -371,20 +478,20 @@ def active_add(request):
         if return_response is not None:
             return return_response
         context = _view_context(document, resolved.rel_path)
-        context['variant_rows'] = _variant_rows(document)
-        context['active_notice'] = f'Added "{resolved.abs_path.name}" to the reader.'
+        context['active_notice'] = f'Added "{resolved.abs_path.name}" to Exports.'
     return _render_view_page(request, context)
 
 
 @require_POST
 def active_remove(request):
-    """Removal is driven by `link_name` (manifest/link identity) alone, per
-    spec 1.5/4.5: it must succeed and unlink the registered symlink even
-    when the source document no longer resolves (missing, unreadable, no
-    longer a supported type, ...) -- that's precisely the case this
-    endpoint exists to clean up. Resolving `rel_path` back to a document is
-    only for choosing which page to render the result on; its failure must
-    never block the removal itself.
+    """Removal is driven by `link_name` (the export directory entry) alone:
+    it must succeed and unlink the symlink even when the source document no
+    longer resolves (missing, unreadable, no longer a supported type, ...)
+    -- that's precisely the case this endpoint exists to clean up.
+    Resolving `rel_path` back to a document is only for choosing which page
+    to render the result on; its failure must never block the removal
+    itself. Reachable in practice only from the Exports page, since
+    collection browse/detail pages no longer offer a remove control.
     """
     _require(request, 'mutate')
     link_name = request.POST.get('link_name', '')
@@ -396,9 +503,9 @@ def active_remove(request):
         error = None
         if result.reason:
             label = active.REASON_LABELS[result.reason]
-            notice = f'Removed "{result.link_name}" from the reader ({label}).'
+            notice = f'Removed "{result.link_name}" from Exports ({label}).'
         else:
-            notice = f'Removed "{result.link_name}" from the reader.'
+            notice = f'Removed "{result.link_name}" from Exports.'
 
     if error is None:
         return_response = _return_after_mutation(request)
@@ -408,7 +515,6 @@ def active_remove(request):
     document, resolved = _resolve_logical(request.POST.get('rel_path', ''))
     if document is not None:
         context = _view_context(document, resolved.rel_path)
-        context['variant_rows'] = _variant_rows(document)
         if error:
             context['active_error'] = error
         if notice:

@@ -14,14 +14,12 @@ class DocumentViewTestCase(TestCase):
         self.root = self.tmp / 'collection'
         self.active = self.tmp / 'active'
         self.cache = self.tmp / 'cache'
-        self.manifest = self.tmp / 'manifest.json'
         self.root.mkdir()
 
         override = override_settings(
             DOCUMENT_VIEWER_ROOT=self.root,
             DOCUMENT_VIEWER_ACTIVE_DIR=self.active,
             DOCUMENT_VIEWER_CACHE_DIR=self.cache,
-            DOCUMENT_VIEWER_ACTIVE_MANIFEST=self.manifest,
             DOCUMENT_VIEWER_AUTHORIZE=(
                 lambda request, action: request.user.is_authenticated
             ),

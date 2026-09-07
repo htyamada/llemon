@@ -1,13 +1,12 @@
 """Settings, defaults, and validation for the documentview app.
 
-`root`, `active_dir`, and `active_manifest` normally come from the repo's
-own `etc/documentview.conf` (loaded into the `appconfig` module by
+`root` and `active_dir` normally come from the repo's own
+`etc/documentview.conf` (loaded into the `appconfig` module by
 `apps.py`'s `ready()`, following the same convention as
 `etc/imhandler.conf`/`etc/llemon_djview.conf`). A host's
-`DOCUMENT_VIEWER_ROOT`/`DOCUMENT_VIEWER_ACTIVE_DIR`/
-`DOCUMENT_VIEWER_ACTIVE_MANIFEST` Django setting, when present *and
-non-empty*, wins over the conf file (see `_configured()`) -- this is what
-lets tests point each of these at a fresh temp directory via
+`DOCUMENT_VIEWER_ROOT`/`DOCUMENT_VIEWER_ACTIVE_DIR` Django setting, when
+present *and non-empty*, wins over the conf file (see `_configured()`) --
+this is what lets tests point each of these at a fresh temp directory via
 `override_settings` without touching the real conf. A setting explicitly
 set to `''` is treated as not set, rather than being resolved as
 `Path('')` -- the process's working directory; `root()`/`active_dir()`
@@ -19,11 +18,14 @@ pure string/PurePath comparison -- no filesystem access. That way
 `manage.py check`, migrations, and unrelated management commands never
 fail just because a deployment mount happens to be absent.
 
-The equivalent live check (that the configured roots exist, and that the
-cache dir / manifest / manifest lock / active dir all resolve outside
-DOCUMENT_VIEWER_ROOT) runs lazily, once per process, the first time a view
-or management command actually touches the filesystem -- see
-`validate_live()`, called from `paths.py`.
+The equivalent live check (that the configured root exists, that the
+cache dir / active dir both resolve outside DOCUMENT_VIEWER_ROOT, and that
+the cache dir resolves outside the active dir -- `active_lock_path()`
+lives under the cache dir, so this is what keeps the lock file from ever
+landing inside the exports directory) runs lazily, once per process, the
+first time a view or management command actually touches the filesystem
+-- see `validate_live()`, called from `paths.py` and from `views.py`'s
+Exports-page endpoints.
 
 Note: `~` expands under the account running `manage.py` / the WSGI process,
 which may differ from the developer's own home directory.
@@ -37,7 +39,6 @@ from django.templatetags.static import static
 from . import appconfig
 
 DEFAULT_CACHE_DIR = '~/var/documentview/cache'
-DEFAULT_ACTIVE_MANIFEST = '~/var/documentview/state/active_manifest.json'
 
 DEFAULT_COVER_SIZES = {
     'thumb': (150, 220),
@@ -105,13 +106,14 @@ def cache_dir() -> Path:
     return Path(value).expanduser().resolve()
 
 
-def active_manifest_path() -> Path:
-    value = _configured('DOCUMENT_VIEWER_ACTIVE_MANIFEST', appconfig.active_manifest) or DEFAULT_ACTIVE_MANIFEST
-    return Path(value).expanduser().resolve()
-
-
-def active_manifest_lock_path() -> Path:
-    return active_manifest_path().with_suffix(active_manifest_path().suffix + '.lock')
+def active_lock_path() -> Path:
+    """Lock file guarding add/remove/prune of the exports directory.
+    Deliberately under `DOCUMENT_VIEWER_CACHE_DIR`, not
+    `DOCUMENT_VIEWER_ACTIVE_DIR` -- the exports directory is exported
+    as-is to external sync software/devices, and the app must never
+    create metadata inside it.
+    """
+    return cache_dir() / 'active.lock'
 
 
 def cover_sizes() -> dict:
@@ -168,10 +170,6 @@ def validate_shape() -> None:
     if not isinstance(cache_value, (str, PurePath)):
         raise ImproperlyConfigured('DOCUMENT_VIEWER_CACHE_DIR must be a path')
 
-    manifest_value = _configured('DOCUMENT_VIEWER_ACTIVE_MANIFEST', appconfig.active_manifest) or DEFAULT_ACTIVE_MANIFEST
-    if not isinstance(manifest_value, (str, PurePath)):
-        raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_MANIFEST must be a path')
-
     authorize_hook = getattr(settings, 'DOCUMENT_VIEWER_AUTHORIZE', _default_authorize)
     if not callable(authorize_hook):
         raise ImproperlyConfigured('DOCUMENT_VIEWER_AUTHORIZE must be callable')
@@ -186,6 +184,13 @@ def validate_shape() -> None:
     if active_pure == root_pure or root_pure in active_pure.parents:
         raise ImproperlyConfigured('DOCUMENT_VIEWER_ACTIVE_DIR must not be inside DOCUMENT_VIEWER_ROOT')
 
+    cache_pure = PurePath(cache_value)
+    if cache_pure == active_pure or active_pure in cache_pure.parents:
+        raise ImproperlyConfigured(
+            'DOCUMENT_VIEWER_CACHE_DIR must not be inside DOCUMENT_VIEWER_ACTIVE_DIR '
+            '(the exports-directory lock file lives under the cache dir -- see active_lock_path())'
+        )
+
 
 def validate_live() -> None:
     """Filesystem-touching validation, run lazily and once per process (per
@@ -196,10 +201,8 @@ def validate_live() -> None:
     resolved_root = root()
     resolved_active = active_dir()
     resolved_cache = cache_dir()
-    resolved_manifest = active_manifest_path()
-    resolved_lock = active_manifest_lock_path()
 
-    cache_key = (resolved_root, resolved_active, resolved_cache, resolved_manifest)
+    cache_key = (resolved_root, resolved_active, resolved_cache)
     if cache_key in _validated_configs:
         return
 
@@ -209,14 +212,17 @@ def validate_live() -> None:
     for name, path in (
         ('DOCUMENT_VIEWER_ACTIVE_DIR', resolved_active),
         ('DOCUMENT_VIEWER_CACHE_DIR', resolved_cache),
-        ('DOCUMENT_VIEWER_ACTIVE_MANIFEST', resolved_manifest),
-        ('DOCUMENT_VIEWER_ACTIVE_MANIFEST lock file', resolved_lock),
     ):
         if path == resolved_root or resolved_root in path.parents:
             raise ImproperlyConfigured(f'{name} must resolve outside DOCUMENT_VIEWER_ROOT: {path}')
 
+    if resolved_cache == resolved_active or resolved_active in resolved_cache.parents:
+        raise ImproperlyConfigured(
+            f'DOCUMENT_VIEWER_CACHE_DIR must resolve outside DOCUMENT_VIEWER_ACTIVE_DIR '
+            f'(the exports-directory lock file lives under the cache dir): {resolved_cache}'
+        )
+
     resolved_active.mkdir(parents=True, exist_ok=True)
     resolved_cache.mkdir(parents=True, exist_ok=True)
-    resolved_manifest.parent.mkdir(parents=True, exist_ok=True)
 
     _validated_configs.add(cache_key)

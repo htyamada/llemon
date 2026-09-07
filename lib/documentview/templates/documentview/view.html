@@ -40,18 +40,11 @@
       <td>{{ row.variant.size|filesizeformat }}</td>
       <td><a href="{% url 'documentview:download' rel_path=row.variant.rel_path %}">Download</a></td>
       <td>
-        {% if row.active_link %}
-        <form method="post" action="{% url 'documentview:active_remove' %}" class="dv-active-form">
-          {% csrf_token %}
-          <input type="hidden" name="link_name" value="{{ row.active_link }}">
-          <input type="hidden" name="rel_path" value="{{ rel_path }}">
-          <button type="submit">Remove from reader</button>
-        </form>
-        {% else %}
+        {% if not row.exported %}
         <form method="post" action="{% url 'documentview:active_add' %}" class="dv-active-form">
           {% csrf_token %}
           <input type="hidden" name="rel_path" value="{{ row.variant.rel_path }}">
-          <button type="submit">Add to reader</button>
+          <button type="submit">Add to exports</button>
         </form>
         {% endif %}
       </td>

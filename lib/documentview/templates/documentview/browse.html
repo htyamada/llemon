@@ -1,11 +1,20 @@
 {% extends "base/base.html" %}
 {% load documentview_extras %}
 
-{% block title %}Document View{% endblock %}
+{% block title %}{% if exports_mode %}Exports{% else %}Document View{% endif %}{% endblock %}
 {% block extra_head %}<link rel="stylesheet" href="{{ documentview_stylesheet_url }}">{% endblock %}
 
 {% block content %}
+{% if exports_mode %}
+<nav class="dv-breadcrumbs"><a href="{% url 'documentview:index' %}">Document View</a> &raquo; Exports</nav>
+<p class="dv-exports-intro">Files currently exported for your reading device.</p>
+{% else %}
 {% include "documentview/_breadcrumbs.html" %}
+<p class="dv-exports-link"><a href="{% url 'documentview:exports_index' %}">Exports</a></p>
+{% endif %}
+
+{% if active_error %}<div class="dv-error">{{ active_error }}</div>{% endif %}
+{% if active_notice %}<div class="dv-notice">{{ active_notice }}</div>{% endif %}
 
 <div class="dv-view-toggle">
   <a class="{% if view_mode == 'cover' %}active{% endif %}"
@@ -35,12 +44,16 @@
       <div class="dv-format-badges">
         {% with active=active_links|dict_get:doc.rel_path %}
         {% for suffix, variant in doc.variants.items %}
-          <span class="dv-badge">{{ suffix|upper }}{% if suffix in active %} <span class="dv-active-badge">reader</span>{% endif %}</span>
+          <span class="dv-badge">{{ suffix|upper }}{% if not exports_mode and suffix in active %} <span class="dv-export-badge">exported</span>{% endif %}</span>
         {% endfor %}
         {% endwith %}
       </div>
       </a>
-      {% include "documentview/_reader_controls.html" with active=active_links|dict_get:doc.rel_path %}
+      {% if exports_mode %}
+        {% include "documentview/_exports_remove_control.html" with link_name=doc.link_name rel_path=doc.rel_path %}
+      {% else %}
+        {% include "documentview/_export_controls.html" with active=active_links|dict_get:doc.rel_path %}
+      {% endif %}
       {% if doc.errors %}<div class="dv-error">collection error</div>{% endif %}
     </div>
     {% endfor %}
@@ -55,10 +68,14 @@
         <td class="dv-format-badges">
           {% with active=active_links|dict_get:doc.rel_path %}
           {% for suffix, variant in doc.variants.items %}
-            <span class="dv-badge">{{ suffix|upper }}{% if suffix in active %} <span class="dv-active-badge">reader</span>{% endif %}</span>
+            <span class="dv-badge">{{ suffix|upper }}{% if not exports_mode and suffix in active %} <span class="dv-export-badge">exported</span>{% endif %}</span>
           {% endfor %}
           {% endwith %}
-          {% include "documentview/_reader_controls.html" with active=active_links|dict_get:doc.rel_path %}
+          {% if exports_mode %}
+            {% include "documentview/_exports_remove_control.html" with link_name=doc.link_name rel_path=doc.rel_path %}
+          {% else %}
+            {% include "documentview/_export_controls.html" with active=active_links|dict_get:doc.rel_path %}
+          {% endif %}
           {% if doc.errors %}<span class="dv-error">collection error</span>{% endif %}
         </td>
       </tr>
@@ -67,6 +84,41 @@
   </table>
   {% endif %}
 {% elif not subdirs %}
-  <p class="dv-empty">This directory has no supported documents.</p>
+  <p class="dv-empty">{% if exports_mode %}Nothing is currently exported.{% else %}This directory has no supported documents.{% endif %}</p>
+{% endif %}
+
+{% if exports_mode %}
+{% if invalid_links %}
+<div class="dv-invalid-links">
+  <h3>Invalid links</h3>
+  <form method="post" action="{% url 'documentview:exports_prune' %}" class="dv-active-form">
+    {% csrf_token %}
+    <input type="hidden" name="return_to" value="{{ request.get_full_path }}">
+    <button type="submit">Delete all invalid links</button>
+  </form>
+  <ul>
+    {% for link in invalid_links %}
+    <li>
+      {{ link.link_name }} &mdash; {{ link.label }}
+      <form method="post" action="{% url 'documentview:active_remove' %}" class="dv-active-form">
+        {% csrf_token %}
+        <input type="hidden" name="link_name" value="{{ link.link_name }}">
+        <input type="hidden" name="return_to" value="{{ request.get_full_path }}">
+        <button type="submit">Remove</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if unexpected_entries %}
+<div class="dv-unexpected-entries">
+  <h3>Unexpected files</h3>
+  <ul>
+    {% for name in unexpected_entries %}<li>{{ name }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
 {% endif %}
 {% endblock %}

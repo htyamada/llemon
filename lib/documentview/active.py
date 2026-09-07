@@ -1,21 +1,16 @@
-"""Offline-reader active-link staging (spec 1.5, 4.5).
+"""Exports-directory staging (directory-is-authority model).
 
-Maintains an app-controlled manifest mapping link names to canonical
-sources, stored outside `DOCUMENT_VIEWER_ACTIVE_DIR` so reader-sync
-software never sees it. Link and manifest updates happen under one
-inter-process lock with atomic (temp-file + `os.replace()`) manifest
-writes. The manifest is the sole source of truth for ownership; a bare
-on-disk symlink is never trusted on its own.
-
-Crash durability across the separate manifest and symlink operations is
-deliberately not a v1 requirement: an interrupted operation may leave a
-mismatch, which is reported clearly rather than silently guessed at, and
-left for `documentview_reconcile_active` or a retry.
+Whatever symlink physically exists in `DOCUMENT_VIEWER_ACTIVE_DIR` *is* an
+export link -- full stop. There is no separate manifest recording
+ownership or intent; the directory's actual symlinks are the sole source
+of truth. add/remove/reconcile operations acquire an `fcntl.flock` lock on
+a sibling lock file (under `DOCUMENT_VIEWER_CACHE_DIR`, never inside the
+exports directory itself -- see `config.active_lock_path()`) before
+touching the directory.
 """
 import contextlib
-import dataclasses
 import fcntl
-import json
+import dataclasses
 import logging
 import os
 import stat
@@ -26,12 +21,14 @@ from . import config, documents, paths
 logger = logging.getLogger('documentview')
 
 REASON_MISSING = 'missing'
+REASON_OUTSIDE_ROOT = 'outside_root'
 REASON_NOT_A_FILE = 'not_a_file'
 REASON_UNREADABLE = 'unreadable'
 REASON_UNSUPPORTED = 'unsupported_type'
 
 REASON_LABELS = {
-    REASON_MISSING: 'the source file is missing',
+    REASON_MISSING: 'the source file is missing or the link could not be resolved (e.g. a symlink loop)',
+    REASON_OUTSIDE_ROOT: 'the link points outside the collection',
     REASON_NOT_A_FILE: 'the source is no longer a regular file',
     REASON_UNREADABLE: 'the source is not readable',
     REASON_UNSUPPORTED: 'the source no longer has a supported suffix',
@@ -42,35 +39,16 @@ class ActiveError(Exception):
     pass
 
 
-class CollisionError(ActiveError):
-    """A different registered source, or an unfamiliar filesystem entry,
-    already occupies the computed active-link name."""
-
-
-class MismatchError(ActiveError):
-    """Manifest and filesystem disagree in a way that must be reported
-    rather than silently repaired."""
-
-
-class ManifestError(ActiveError):
-    """The manifest file exists but could not be read or parsed. Distinct
-    from a simply-missing manifest (which legitimately means "no active
-    links yet"): a corrupt or unreadable manifest must surface as a clear,
-    repairable error rather than being silently treated as empty, which
-    would make every existing managed link look foreign and block its
-    normal removal."""
-
-
 @dataclasses.dataclass
 class RemoveResult:
     link_name: str
-    reason: 'str | None'  # None means the source was valid when removed
+    reason: 'str | None'  # None means the link was valid when removed
 
 
 @dataclasses.dataclass
 class ReconcileIssue:
     link_name: str
-    kind: str  # 'missing_symlink' | 'broken_source' | 'wrong_target' | 'invalid_entry' | 'foreign'
+    kind: str  # 'invalid_link' | 'unexpected_entry'
     detail: str
     repaired: bool = False
 
@@ -78,7 +56,7 @@ class ReconcileIssue:
 @contextlib.contextmanager
 def _locked():
     config.validate_live()
-    lock_path = config.active_manifest_lock_path()
+    lock_path = config.active_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, 'a+b') as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -88,371 +66,236 @@ def _locked():
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def _read_manifest() -> dict:
-    """A missing manifest legitimately means "no active links yet" and
-    reads as `{}`. A manifest that exists but is unreadable or not valid
-    JSON is a real problem -- raise `ManifestError` rather than silently
-    treating it as empty (see `ManifestError`'s docstring).
-    """
-    manifest_path = config.active_manifest_path()
-    try:
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            raw = f.read()
-    except FileNotFoundError:
-        return {}
-    except OSError as e:
-        raise ManifestError(f'cannot read active-link manifest {manifest_path}: {e}') from e
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ManifestError(f'active-link manifest {manifest_path} is not valid JSON: {e}') from e
-    if not isinstance(data, dict):
-        raise ManifestError(f'active-link manifest {manifest_path} does not contain a JSON object')
-    return data
+def _validate_link_name(link_name: str) -> None:
+    if not link_name or '/' in link_name or link_name in ('.', '..') or '\x00' in link_name:
+        raise ActiveError('invalid export link name')
 
 
-def _write_manifest(data: dict) -> None:
-    manifest_path = config.active_manifest_path()
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = manifest_path.with_name(f'{manifest_path.name}.{os.getpid()}.tmp')
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp_path, manifest_path)
+def _classify_link(link_path: Path):
+    """Classify a symlink under `active_dir` from its own resolved target
+    (not a trusted rel_path -- a hand-created symlink can point anywhere).
 
-
-def load_manifest_sources() -> dict:
-    """`source rel_path -> link_name`, for cheap display-only active-state
-    lookups (browse/view tiles). Not locked -- a plain read is fine for
-    display; mutations below always re-check under the lock.
-
-    Includes *both* the canonical source path and, when the document was
-    activated through an in-hierarchy symlink, the path it was activated
-    from, so the active badge appears wherever the collection lists that
-    file rather than only under the symlink target's own directory.
-
-    Unlike the mutating operations, a corrupt manifest here degrades to
-    "no active badges shown" (logged) rather than breaking browsing --
-    matching this app's general "malformed input degrades, never breaks
-    browsing" posture (spec 1.2). `add_active`/`remove_active` do *not*
-    swallow `ManifestError` this way: a mutation must see the real error.
+    Returns `(reason, real_path)`; `reason is None` means the link is a
+    fully valid, in-collection, supported document, and `real_path` is
+    then its real absolute path.
     """
     try:
-        manifest = _read_manifest()
-    except ManifestError as e:
-        logger.error('documentview: %s', e)
-        return {}
+        real = link_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        # OSError: a dangling target. RuntimeError: resolve()'s documented
+        # exception for a symlink loop -- a hand-created circular symlink
+        # is possible and must not propagate as an unhandled exception.
+        # Both fold into REASON_MISSING: neither has a resolvable real
+        # path, and both are handled identically everywhere.
+        return REASON_MISSING, None
 
-    sources = {}
-    for link_name, entry in manifest.items():
-        for key in ('source', 'requested'):
-            value = entry.get(key)
-            if value:
-                sources[value] = link_name
-    return sources
-
-
-def find_link_for_source(source_rel_path: str) -> 'str | None':
-    return load_manifest_sources().get(source_rel_path)
-
-
-def _resolve_source_candidate(source_rel_path: str) -> Path:
-    """Safe, contained, symlink-resolved absolute path for a manifest
-    `source` value. Raises `paths.PathError` if it is malformed (absolute,
-    `..`, empty, NUL), missing, or would resolve outside
-    `DOCUMENT_VIEWER_ROOT`.
-
-    A manifest `source`/link name is untrusted input -- it can come from a
-    corrupted or hand-edited manifest (spec 1.5) -- so it is never joined
-    onto the root and trusted directly; `_classify_source()` and
-    `reconcile()`'s repair path must not create or follow a link that
-    escapes the collection root just because a traversal path was waved
-    through as "missing" or "valid".
-    """
-    normalized = paths.normalize_rel_path(source_rel_path)
-    candidate = config.root().joinpath(*normalized.split('/'))
-    try:
-        real = candidate.resolve(strict=True)
-    except OSError as e:
-        raise paths.PathError(str(e)) from e
     try:
         real.relative_to(config.root())
-    except ValueError as e:
-        raise paths.PathError('source escapes collection root') from e
-    return real
+    except ValueError:
+        return REASON_OUTSIDE_ROOT, None
 
-
-def _classify_source(source_rel_path: str) -> 'str | None':
-    """`None` means the source currently validates; otherwise one of the
-    REASON_* constants, checked in the priority order spec 4.5 lists:
-    missing, not-a-file, unreadable, unsupported-suffix.
-    """
-    if not source_rel_path:
-        return REASON_MISSING
-    try:
-        real = _resolve_source_candidate(source_rel_path)
-    except paths.PathError:
-        return REASON_MISSING
     try:
         st = real.stat()
     except OSError:
-        return REASON_MISSING
+        return REASON_MISSING, None
 
     if not stat.S_ISREG(st.st_mode):
-        return REASON_NOT_A_FILE
+        return REASON_NOT_A_FILE, None
     if not os.access(real, os.R_OK):
-        return REASON_UNREADABLE
+        return REASON_UNREADABLE, None
     if real.suffix.lower() not in documents.SUPPORTED_SUFFIXES:
-        return REASON_UNSUPPORTED
-    return None
+        return REASON_UNSUPPORTED, None
+    return None, real
 
 
-def _link_matches_source(link_path: Path, expected_abs_source: Path) -> bool:
-    if not link_path.is_symlink():
-        return False
+def active_badge_paths() -> set:
+    """Real paths of currently-exported documents, for browse/detail-page
+    "exported" badges only -- not a link registry. Multiple links
+    (including hand-created duplicates) resolving to the same real file
+    collapse to one set entry, which is correct for an existence check.
+    A plain, display-only `Path.resolve()`, not the hardened O_NOFOLLOW
+    resolver used to actually open files.
+    """
     try:
-        return link_path.resolve(strict=True) == expected_abs_source
+        active_dir = config.active_dir()
+        entries = list(os.scandir(active_dir))
     except OSError:
-        return False
+        return set()
+
+    found = set()
+    for entry in entries:
+        name = entry.name
+        if name.startswith('.'):
+            continue
+        try:
+            if not entry.is_symlink():
+                continue
+        except OSError:
+            continue
+        reason, real = _classify_link(active_dir / name)
+        if reason is None:
+            found.add(real)
+    return found
 
 
 def add_active(source_rel_path: str) -> str:
-    """Create (or idempotently confirm) an active-reader link for the
-    exact selected source format. Returns the link name.
+    """Create (or idempotently confirm) an export link for the exact
+    selected source format. Returns the link name.
 
     Raises `paths.PathError` if `source_rel_path` isn't a valid document,
-    `CollisionError` if the computed name is taken by something else, or
-    `MismatchError` if it's already registered to this source but the
-    on-disk symlink is missing/wrong.
+    or `ActiveError` if the computed name is occupied by a non-symlink
+    entry (refused, since that might be the user's own data) or the
+    filesystem operation itself fails.
     """
-    requested_source = paths.normalize_rel_path(source_rel_path)
     with paths.resolve_document(source_rel_path) as resolved:
-        canonical_source = resolved.rel_path
         source_abs = resolved.abs_path
         link_name = source_abs.name
 
     with _locked():
-        manifest = _read_manifest()
         active_dir = config.active_dir()
         active_dir.mkdir(parents=True, exist_ok=True)
         link_path = active_dir / link_name
 
-        entry = manifest.get(link_name)
-        if entry is not None and entry.get('source') == canonical_source:
-            if not _link_matches_source(link_path, source_abs):
-                raise MismatchError(
-                    f'"{link_name}" is already registered to this source, but its symlink is missing or incorrect'
-                )
-            # Idempotent confirm. Still record a not-yet-seen requested
-            # alias: e.g. the document was first activated as
-            # `real/Book.epub` and is now also being activated as
-            # `selected/Book.epub` -- without this, the curated directory's
-            # UI would keep showing it as inactive forever (spec 1.5).
-            if requested_source != canonical_source and entry.get('requested') != requested_source:
-                entry['requested'] = requested_source
-                manifest[link_name] = entry
-                try:
-                    _write_manifest(manifest)
-                except OSError as e:
-                    raise ActiveError(
-                        f'"{link_name}" is already active, but failed to record the new alias: {e}'
-                    ) from e
+        if not os.path.lexists(link_path):
+            try:
+                os.symlink(source_abs, link_path)
+            except OSError as e:
+                raise ActiveError(f'failed to create export link "{link_name}": {e}') from e
             return link_name
 
-        if entry is not None:
-            raise CollisionError(f'"{link_name}" is already active for a different source')
+        if link_path.is_symlink():
+            try:
+                current_target = link_path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                current_target = None  # dangling, or a symlink loop
+            if current_target == source_abs:
+                return link_name  # idempotent no-op
+            # Conflict: latest write wins. A dangling link is just another
+            # "wrong target" to replace, not a special case.
+            try:
+                link_path.unlink()
+                os.symlink(source_abs, link_path)
+            except OSError as e:
+                raise ActiveError(f'failed to replace export link "{link_name}": {e}') from e
+            return link_name
 
-        if link_path.exists(follow_symlinks=False):
-            raise CollisionError(f'"{link_name}" already exists in the active directory')
-
-        try:
-            os.symlink(source_abs, link_path)
-        except OSError as e:
-            raise ActiveError(f'failed to create active link "{link_name}": {e}') from e
-
-        entry = {'source': canonical_source}
-        if requested_source != canonical_source:
-            # The user activated this file through an in-hierarchy symlink
-            # (e.g. a curated `selected/` directory). Record that path too,
-            # so the browse/detail pages recognize the document as active
-            # under the path they actually list it at -- not only under the
-            # symlink target's canonical path. `source` stays canonical and
-            # remains the single identity used for collision, idempotency,
-            # and source-validity checks.
-            entry['requested'] = requested_source
-        manifest[link_name] = entry
-        try:
-            _write_manifest(manifest)
-        except OSError as e:
-            raise ActiveError(f'created active link "{link_name}" but failed to update the manifest: {e}') from e
-
-        return link_name
-
-
-def _validate_link_name(link_name: str) -> None:
-    if not link_name or '/' in link_name or link_name in ('.', '..') or '\x00' in link_name:
-        raise ActiveError('invalid active link name')
+        raise ActiveError(
+            f'"{link_name}" already exists in the exports directory and is not a symlink; refusing to replace it'
+        )
 
 
 def remove_active(link_name: str) -> RemoveResult:
-    """Remove an app-owned active link. Only ever unlinks a symlink
-    directly inside `DOCUMENT_VIEWER_ACTIVE_DIR` that is registered in the
-    manifest -- never an arbitrary path, and never the link's target.
+    """Remove an export link. Only ever unlinks a symlink directly inside
+    `DOCUMENT_VIEWER_ACTIVE_DIR` -- never an arbitrary path, and never the
+    link's target. Presence as a symlink is the only authorization needed;
+    there is no separate registry to check membership against.
 
-    Removal succeeds regardless of the registered source's current state;
+    Removal succeeds regardless of the link's current validity;
     `RemoveResult.reason` reports *why* if it no longer validates.
     """
     _validate_link_name(link_name)
 
     with _locked():
-        manifest = _read_manifest()
-        entry = manifest.get(link_name)
-        if entry is None:
-            raise ActiveError(f'"{link_name}" is not an app-managed active link')
-
         active_dir = config.active_dir()
         dir_fd = os.open(active_dir, os.O_RDONLY | os.O_DIRECTORY)
         try:
             try:
                 st = os.lstat(link_name, dir_fd=dir_fd)
             except OSError as e:
-                raise ActiveError(f'"{link_name}" is not present in the active directory: {e}') from e
+                raise ActiveError(f'"{link_name}" is not present in the exports directory: {e}') from e
             if not stat.S_ISLNK(st.st_mode):
                 raise ActiveError(f'"{link_name}" is not a symlink; refusing to remove it')
 
-            reason = _classify_source(entry['source'])
+            reason, _real = _classify_link(active_dir / link_name)
 
             try:
                 os.unlink(link_name, dir_fd=dir_fd)
             except OSError as e:
-                raise ActiveError(f'failed to remove active link "{link_name}": {e}') from e
+                raise ActiveError(f'failed to remove export link "{link_name}": {e}') from e
         finally:
             os.close(dir_fd)
-
-        del manifest[link_name]
-        try:
-            _write_manifest(manifest)
-        except OSError as e:
-            raise ActiveError(f'removed active link "{link_name}" but failed to update the manifest: {e}') from e
 
     return RemoveResult(link_name=link_name, reason=reason)
 
 
+def remove_invalid() -> int:
+    """Delete every currently-invalid export symlink (any REASON_*,
+    including outside-root). Returns the number removed. Never even calls
+    `_classify_link()` on a non-symlink entry (enumeration rule), so this
+    can't touch a stray non-symlink file.
+    """
+    removed = 0
+    with _locked():
+        active_dir = config.active_dir()
+        try:
+            entries = list(os.scandir(active_dir))
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry.name
+            if name.startswith('.'):
+                continue
+            try:
+                if not entry.is_symlink():
+                    continue
+            except OSError:
+                continue
+            reason, _real = _classify_link(active_dir / name)
+            if reason is None:
+                continue
+            try:
+                os.unlink(active_dir / name)
+            except OSError:
+                continue
+            removed += 1
+    return removed
+
+
 def reconcile(repair: bool = False) -> list:
-    """Report (and, with `repair=True`, fix) manifest/filesystem
-    disagreements. Never touches a foreign symlink (one present in
-    `DOCUMENT_VIEWER_ACTIVE_DIR` but absent from the manifest) -- those are
-    always reported only, matching spec 1.5's "no automatic adoption".
+    """Report (and, with `repair=True`, prune) invalid export symlinks.
+
+    A visible non-symlink entry is never classified as valid/invalid --
+    it's reported as its own informational `unexpected_entry` issue,
+    never touched by `--repair`. Hidden entries (name starting with `.`)
+    are always skipped entirely.
     """
     issues = []
     with _locked():
-        manifest = _read_manifest()
         active_dir = config.active_dir()
         active_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            entries = list(os.scandir(active_dir))
+        except OSError:
+            entries = []
+        entries.sort(key=lambda e: e.name)
 
-        on_disk = {entry.name for entry in active_dir.iterdir() if entry.is_symlink()}
-        changed = False
-
-        for link_name, entry in list(manifest.items()):
+        for entry in entries:
+            name = entry.name
+            if name.startswith('.'):
+                continue
             try:
-                _validate_link_name(link_name)
-            except ActiveError:
-                # A manifest key that isn't a bare filename (e.g. containing
-                # `/` or `..`) can never correspond to a real app-managed
-                # link -- active_dir / link_name is only ever computed for a
-                # validated name below, so this entry is simply corrupt data
-                # rather than something to repair a symlink for.
-                if repair:
-                    del manifest[link_name]
-                    changed = True
-                    issues.append(
-                        ReconcileIssue(link_name, 'invalid_entry', 'invalid link name; manifest entry removed', repaired=True)
-                    )
-                else:
-                    issues.append(ReconcileIssue(link_name, 'invalid_entry', 'invalid link name in manifest'))
+                is_symlink = entry.is_symlink()
+            except OSError:
                 continue
 
-            source_rel = entry.get('source')
-            link_path = active_dir / link_name
-
-            if not link_path.is_symlink():
-                reason = _classify_source(source_rel) if source_rel else REASON_MISSING
-                if reason is None:
-                    if repair:
-                        try:
-                            real = _resolve_source_candidate(source_rel)
-                            os.symlink(real, link_path)
-                            issues.append(ReconcileIssue(link_name, 'missing_symlink', 'recreated', repaired=True))
-                        except (paths.PathError, OSError) as e:
-                            issues.append(ReconcileIssue(link_name, 'missing_symlink', f'recreate failed: {e}'))
-                    else:
-                        issues.append(
-                            ReconcileIssue(link_name, 'missing_symlink', 'symlink missing; source still valid')
-                        )
-                else:
-                    label = REASON_LABELS.get(reason, reason)
-                    if repair:
-                        del manifest[link_name]
-                        changed = True
-                        issues.append(
-                            ReconcileIssue(
-                                link_name, 'missing_symlink',
-                                f'symlink missing; source invalid ({label}); manifest entry removed',
-                                repaired=True,
-                            )
-                        )
-                    else:
-                        issues.append(
-                            ReconcileIssue(link_name, 'missing_symlink', f'symlink missing; source invalid ({label})')
-                        )
+            if not is_symlink:
+                issues.append(
+                    ReconcileIssue(name, 'unexpected_entry', 'unexpected non-symlink entry in the exports directory')
+                )
                 continue
 
-            reason = _classify_source(source_rel) if source_rel else REASON_MISSING
-            if reason is not None:
-                label = REASON_LABELS.get(reason, reason)
-                if repair:
-                    try:
-                        os.unlink(link_path)
-                    except OSError:
-                        pass
-                    del manifest[link_name]
-                    changed = True
-                    issues.append(
-                        ReconcileIssue(link_name, 'broken_source', f'source invalid ({label}); removed', repaired=True)
-                    )
-                else:
-                    issues.append(ReconcileIssue(link_name, 'broken_source', f'source invalid ({label})'))
+            link_path = active_dir / name
+            reason, _real = _classify_link(link_path)
+            if reason is None:
                 continue
-
-            # Source validates and the link exists -- but does it actually
-            # point at that source? A link silently replaced with a symlink
-            # to something else would otherwise never be caught here, since
-            # nothing above compares the link's target against the
-            # registered source.
-            try:
-                expected = _resolve_source_candidate(source_rel)
-            except paths.PathError:
-                expected = None  # _classify_source already validated this; defensive only
-
-            if expected is not None and not _link_matches_source(link_path, expected):
-                if repair:
-                    try:
-                        os.unlink(link_path)
-                        os.symlink(expected, link_path)
-                        issues.append(
-                            ReconcileIssue(link_name, 'wrong_target', 'symlink pointed elsewhere; relinked', repaired=True)
-                        )
-                    except OSError as e:
-                        issues.append(ReconcileIssue(link_name, 'wrong_target', f'relink failed: {e}'))
-                else:
-                    issues.append(
-                        ReconcileIssue(link_name, 'wrong_target', 'symlink target does not match the registered source')
-                    )
-
-        for name in sorted(on_disk - set(manifest)):
-            issues.append(ReconcileIssue(name, 'foreign', 'symlink present but not registered; left in place'))
-
-        if changed:
-            _write_manifest(manifest)
+            label = REASON_LABELS.get(reason, reason)
+            if repair:
+                try:
+                    os.unlink(link_path)
+                    issues.append(ReconcileIssue(name, 'invalid_link', f'{label}; removed', repaired=True))
+                except OSError as e:
+                    issues.append(ReconcileIssue(name, 'invalid_link', f'{label}; remove failed: {e}'))
+            else:
+                issues.append(ReconcileIssue(name, 'invalid_link', label))
 
     return issues

@@ -1,29 +1,26 @@
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import BaseCommand
 
 from documentview import active
 
 
 class Command(BaseCommand):
     help = (
-        'Report documentview active-link manifest/filesystem disagreements. '
-        'With --repair, recreate or drop app-owned manifest entries whose '
-        'symlink or source is broken. Foreign symlinks (present but not in '
-        'the manifest) are always reported only, never adopted or removed.'
+        'Report invalid documentview export symlinks (missing source, outside the '
+        'collection root, not a regular file, unreadable, or unsupported suffix). '
+        'With --repair, delete them. A stray non-symlink entry in the exports '
+        'directory is always reported only, as informational only, and never touched.'
     )
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--repair', action='store_true',
-            help='Explicitly repair app-owned mismatches instead of only reporting them.',
+            help='Delete invalid export links instead of only reporting them.',
         )
 
     def handle(self, *args, **options):
-        try:
-            issues = active.reconcile(repair=options['repair'])
-        except active.ManifestError as e:
-            raise CommandError(str(e)) from e
+        issues = active.reconcile(repair=options['repair'])
         if not issues:
-            self.stdout.write(self.style.SUCCESS('No manifest/filesystem disagreements found.'))
+            self.stdout.write(self.style.SUCCESS('No invalid export links found.'))
             return
         for issue in issues:
             marker = 'REPAIRED' if issue.repaired else issue.kind.upper()

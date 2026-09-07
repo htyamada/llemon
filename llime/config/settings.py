@@ -144,9 +144,9 @@ USE_TZ = True
 STATIC_URL = '/zorf/llime/static/'
 
 # documentview -- see ../../lib/documentview/CLAUDE.md.
-# DOCUMENT_VIEWER_ROOT / DOCUMENT_VIEWER_ACTIVE_DIR / DOCUMENT_VIEWER_ACTIVE_MANIFEST
-# are configured in ../../etc/documentview.conf (variant selected by
-# DOCUMENT_VIEWER_VARIANT above), not here -- see that file to change them.
+# DOCUMENT_VIEWER_ROOT / DOCUMENT_VIEWER_ACTIVE_DIR are configured in
+# ../../etc/documentview.conf (variant selected by DOCUMENT_VIEWER_VARIANT
+# above), not here -- see that file to change them.
 DOCUMENT_VIEWER_STYLESHEET_URL = '/zorf/llime/static/base/css/documentview.css'
 
 

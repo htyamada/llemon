@@ -1,6 +1,6 @@
 Shared, reusable Django app for browsing and lightly previewing a directory
 tree of PDF/EPUB/CBZ/Markdown/text documents, and staging a selected format
-into a separate active-reader directory. It is a browser and selection
+into a separate exports directory. It is a browser and selection
 tool, not an online reader.
 
 The canonical copy lives at `~/prj/grove/lib/documentview`. Host Django

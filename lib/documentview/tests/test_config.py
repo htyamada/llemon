@@ -65,3 +65,29 @@ class EmptyRootFallbackTests(DocumentViewTestCase):
         with override_settings(DOCUMENT_VIEWER_ROOT=''):
             with mock.patch.object(config.appconfig, 'root', ''):
                 config.validate_shape()  # must not raise -- "app installed but not configured"
+
+
+class CacheDirInsideActiveDirTests(DocumentViewTestCase):
+    """Regression: the exports-directory lock file lives at
+    `active_lock_path() == cache_dir() / 'active.lock'`. If
+    DOCUMENT_VIEWER_CACHE_DIR is configured to equal, or nest inside,
+    DOCUMENT_VIEWER_ACTIVE_DIR, the lock file would land inside the exports
+    directory itself -- exactly what moving the lock out of active_dir was
+    meant to prevent. Only ROOT-vs-ACTIVE_DIR/CACHE_DIR containment used to
+    be checked; CACHE_DIR-vs-ACTIVE_DIR was not.
+    """
+
+    def test_validate_shape_rejects_cache_dir_equal_to_active_dir(self):
+        with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active)):
+            with self.assertRaises(ImproperlyConfigured):
+                config.validate_shape()
+
+    def test_validate_shape_rejects_cache_dir_nested_inside_active_dir(self):
+        with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active / 'nested')):
+            with self.assertRaises(ImproperlyConfigured):
+                config.validate_shape()
+
+    def test_validate_live_rejects_cache_dir_nested_inside_active_dir(self):
+        with override_settings(DOCUMENT_VIEWER_CACHE_DIR=str(self.active / 'nested')):
+            with self.assertRaises(ImproperlyConfigured):
+                config.validate_live()
